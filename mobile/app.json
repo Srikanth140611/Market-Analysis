@@ -1,0 +1,21 @@
+{
+  "expo": {
+    "name": "Market Analysis",
+    "slug": "market-analysis",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#0d1b2a"
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    }
+  }
+}

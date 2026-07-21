@@ -1,0 +1,13 @@
+{
+  "name": "market-analysis-platform",
+  "private": true,
+  "workspaces": [
+    "mobile",
+    "api"
+  ],
+  "scripts": {
+    "dev:api": "npm --workspace api run dev",
+    "dev:mobile": "npm --workspace mobile run start",
+    "build": "npm --workspace api run build"
+  }
+}
