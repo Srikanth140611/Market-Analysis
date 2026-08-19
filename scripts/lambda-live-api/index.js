@@ -3,6 +3,8 @@ const RSS_FEEDS = [
   "https://finance.yahoo.com/news/rssindex"
 ];
 
+const STRICT_LIVE_MODE = true;
+
 const HISTORY_SYMBOLS = {
   "AUD/USD": { symbol: "AUD/USD", name: "Australian Dollar vs US Dollar", category: "forex", yahooCode: "AUDUSD=X" },
   "EUR/USD": { symbol: "EUR/USD", name: "Euro vs US Dollar", category: "forex", yahooCode: "EURUSD=X" },
@@ -414,6 +416,7 @@ async function getLiveHistory(symbols, timeframes, years = 5) {
       const meta = HISTORY_SYMBOLS[symbol];
       const liveSpotPrice = meta.category === "forex" ? await fetchYahooForexSpotPrice(meta.yahooCode) : null;
       const liveDailyCandles = await fetchYahooHistory(meta.yahooCode);
+
       const referencePrice = Number(liveSpotPrice || referencePrices.get(meta.symbol) || DEFAULT_REFERENCE_PRICES[meta.symbol] || 0);
       const baseDailyCandles = liveDailyCandles.length > 0
         ? liveDailyCandles
@@ -434,30 +437,20 @@ async function getLiveHistory(symbols, timeframes, years = 5) {
 
     for (const timeframe of uniqueTimeframes) {
       let frameCandles = baseDailyCandles;
-      let source = liveDailyCandles.length > 0 ? (timeframe === "1Day" ? "live" : "derived") : "derived";
-      let note = liveDailyCandles.length > 0
-        ? `Live Yahoo daily history for ${symbol}`
-        : `Derived 5-year history for ${symbol} from live reference prices`;
+      let source = "live";
+      let note = `Live Yahoo daily history for ${symbol}`;
 
       if (timeframe === "1Week") {
         frameCandles = aggregateCandles(frameCandles, 5);
-        note = liveDailyCandles.length > 0
-          ? `Derived weekly history from Yahoo daily closes for ${symbol}`
-          : `Derived weekly history for ${symbol} from synthetic daily candles`;
+        note = `Derived weekly history from Yahoo daily closes for ${symbol}`;
       } else if (timeframe === "12hour") {
         frameCandles = aggregateCandles(frameCandles, 2);
-        note = liveDailyCandles.length > 0
-          ? `Derived 12-hour history from Yahoo daily closes for ${symbol}`
-          : `Derived 12-hour history for ${symbol} from synthetic daily candles`;
+        note = `Derived 12-hour history from Yahoo daily closes for ${symbol}`;
       } else if (timeframe === "8hour") {
         frameCandles = aggregateCandles(frameCandles, 3);
-        note = liveDailyCandles.length > 0
-          ? `Derived 8-hour history from Yahoo daily closes for ${symbol}`
-          : `Derived 8-hour history for ${symbol} from synthetic daily candles`;
+        note = `Derived 8-hour history from Yahoo daily closes for ${symbol}`;
       } else if (timeframe !== "1Day") {
-        note = liveDailyCandles.length > 0
-          ? `${symbol} does not expose public ${timeframeLabel(timeframe)} history here; using derived bars from daily history`
-          : `${symbol} does not expose public ${timeframeLabel(timeframe)} history here; using derived bars from synthetic daily history`;
+        note = `${symbol} does not expose public ${timeframeLabel(timeframe)} history here; using derived bars from live daily history`;
       }
 
       if (meta.category === "forex" && Number.isFinite(liveSpotPrice) && liveSpotPrice > 0) {
