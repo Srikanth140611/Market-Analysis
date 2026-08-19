@@ -1,3 +1,4 @@
+import { getLiveForexSpotPrice } from "./marketService.js";
 import { getMarketHistory, type HistoryTimeframe, type MarketAssetCategory, type MarketPatternSignal, type HistorySource } from "./marketHistoryService.js";
 
 export type MarketAgentName = "Forex" | "Commodities" | "Oil";
@@ -486,10 +487,11 @@ function buildSignal(
   timeframe: MarketAgentAnalysisTimeframe,
   pattern: MarketPatternSignal,
   candles: { t: number; o: number; h: number; l: number; c: number }[],
-  source: HistorySource
+  source: HistorySource,
+  liveSpotPrice?: number | null
 ): MarketAgentTimeframeSignal {
   const latestCandle = candles[candles.length - 1] ?? null;
-  const currentPrice = latestCandle?.c ?? pattern.latestClose;
+  const currentPrice = liveSpotPrice ?? latestCandle?.c ?? pattern.latestClose;
   const lastOccurrenceAt = latestCandle ? formatTimestamp(latestCandle.t > 1e12 ? latestCandle.t : latestCandle.t * 1000) : new Date().toISOString();
   const confidence = Math.round(pattern.confidence);
   const strategiesApplied = strategiesForPattern(pattern.pattern, pattern.direction, category, symbol);
@@ -550,6 +552,7 @@ export async function getMarketAgentsAnalysis(): Promise<MarketAgentsResponse> {
     const agentSignals: MarketAgentTimeframeSignal[] = [];
 
     for (const symbol of config.symbols) {
+      const liveSpotPrice = config.category === "forex" ? await getLiveForexSpotPrice(symbol) : null;
       const symbolHistory = history.data[symbol] ?? {};
       const timeframeSignals = ANALYSIS_TIMEFRAMES
         .map((timeframe) => {
@@ -560,7 +563,7 @@ export async function getMarketAgentsAnalysis(): Promise<MarketAgentsResponse> {
           }
 
           sources.add(frame.source);
-          return buildSignal(symbol, config.category, timeframe, pattern, frame.candles, frame.source);
+          return buildSignal(symbol, config.category, timeframe, pattern, frame.candles, frame.source, liveSpotPrice);
         })
         .filter((signal): signal is MarketAgentTimeframeSignal => Boolean(signal));
 

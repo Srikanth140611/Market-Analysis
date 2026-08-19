@@ -214,6 +214,36 @@ async function fetchYahooHistory(symbol) {
   });
 }
 
+async function fetchYahooForexSpotPrice(symbol) {
+  const response = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1m&range=1d`, {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      Accept: "application/json,text/plain,*/*",
+      Referer: "https://finance.yahoo.com/"
+    }
+  });
+
+  if (!response.ok) {
+    return null;
+  }
+
+  const payload = await response.json();
+  const result = payload?.chart?.result?.[0];
+  const closes = result?.indicators?.quote?.[0]?.close;
+  if (!Array.isArray(closes)) {
+    return null;
+  }
+
+  for (let index = closes.length - 1; index >= 0; index -= 1) {
+    const value = Number(closes[index]);
+    if (Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+
+  return null;
+}
+
 function sma(values, period) {
   if (values.length === 0) {
     return 0;
@@ -382,13 +412,14 @@ async function getLiveHistory(symbols, timeframes, years = 5) {
   const historiesBySymbol = new Map(
     await Promise.all(uniqueSymbols.map(async (symbol) => {
       const meta = HISTORY_SYMBOLS[symbol];
+      const liveSpotPrice = meta.category === "forex" ? await fetchYahooForexSpotPrice(meta.yahooCode) : null;
       const liveDailyCandles = await fetchYahooHistory(meta.yahooCode);
-      const referencePrice = Number(referencePrices.get(meta.symbol) || DEFAULT_REFERENCE_PRICES[meta.symbol] || 0);
+      const referencePrice = Number(liveSpotPrice || referencePrices.get(meta.symbol) || DEFAULT_REFERENCE_PRICES[meta.symbol] || 0);
       const baseDailyCandles = liveDailyCandles.length > 0
         ? liveDailyCandles
         : buildSyntheticDailyHistory(meta, years, referencePrice > 0 ? referencePrice : 1);
 
-      return [symbol, { meta, liveDailyCandles, baseDailyCandles }];
+      return [symbol, { meta, liveDailyCandles, baseDailyCandles, liveSpotPrice }];
     }))
   );
 
@@ -398,7 +429,7 @@ async function getLiveHistory(symbols, timeframes, years = 5) {
       continue;
     }
 
-    const { meta, liveDailyCandles, baseDailyCandles } = symbolHistory;
+    const { meta, liveDailyCandles, baseDailyCandles, liveSpotPrice } = symbolHistory;
     data[symbol] = {};
 
     for (const timeframe of uniqueTimeframes) {
@@ -427,6 +458,10 @@ async function getLiveHistory(symbols, timeframes, years = 5) {
         note = liveDailyCandles.length > 0
           ? `${symbol} does not expose public ${timeframeLabel(timeframe)} history here; using derived bars from daily history`
           : `${symbol} does not expose public ${timeframeLabel(timeframe)} history here; using derived bars from synthetic daily history`;
+      }
+
+      if (meta.category === "forex" && Number.isFinite(liveSpotPrice) && liveSpotPrice > 0) {
+        frameCandles = overlayLiveSpotOnCandles(frameCandles, liveSpotPrice);
       }
 
       frameCandles = compressCandles(frameCandles, timeframeToTargetCount(timeframe));
@@ -813,9 +848,9 @@ function buildTradePlan(price, support, resistance, direction, pattern, confiden
   };
 }
 
-function buildSignal(symbol, category, timeframe, pattern, candles, source) {
+function buildSignal(symbol, category, timeframe, pattern, candles, source, liveSpotPrice) {
   const latest = candles[candles.length - 1] || null;
-  const currentPrice = latest?.c ?? pattern.latestClose;
+  const currentPrice = liveSpotPrice ?? latest?.c ?? pattern.latestClose;
   const lastOccurrenceAt = latest
     ? new Date((latest.t > 1e12 ? latest.t : latest.t * 1000)).toISOString()
     : new Date().toISOString();
@@ -866,6 +901,7 @@ async function getLiveAgents() {
     const agentSignals = [];
 
     for (const symbol of config.symbols) {
+      const liveSpotPrice = config.category === "forex" ? await fetchYahooForexSpotPrice(HISTORY_SYMBOLS[symbol].yahooCode) : null;
       const symbolHistory = history.data[symbol] || {};
       const timeframeSignals = ANALYSIS_TIMEFRAMES.map((timeframe) => {
         const frame = symbolHistory[timeframe];
@@ -875,7 +911,7 @@ async function getLiveAgents() {
         }
 
         sources.add(frame.source);
-        return buildSignal(symbol, config.category, timeframe, pattern, frame.candles, frame.source);
+        return buildSignal(symbol, config.category, timeframe, pattern, frame.candles, frame.source, config.category === "forex" ? liveSpotPrice : null);
       }).filter(Boolean);
 
       if (timeframeSignals.length === 0) {
@@ -1069,6 +1105,22 @@ function buildSyntheticDailyHistory(meta, years, basePrice) {
     l: candle.l * scale,
     c: candle.c * scale
   }));
+}
+
+function overlayLiveSpotOnCandles(candles, livePrice) {
+  if (!Array.isArray(candles) || candles.length === 0 || !Number.isFinite(livePrice) || livePrice <= 0) {
+    return candles;
+  }
+
+  const output = candles.slice();
+  const last = output[output.length - 1];
+  output[output.length - 1] = {
+    ...last,
+    h: Math.max(last.h, livePrice),
+    l: Math.min(last.l, livePrice),
+    c: livePrice
+  };
+  return output;
 }
 
 async function getReferencePriceMap() {

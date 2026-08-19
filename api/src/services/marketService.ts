@@ -153,6 +153,59 @@ const FOREX_SYMBOLS: Record<string, string> = {
   "EUR/CAD": "OANDA:EUR_CAD"
 };
 
+export async function getLiveForexSpotPrice(pair: string): Promise<number | null> {
+  const yahooSymbol = FOREX_SYMBOLS[pair];
+  if (!yahooSymbol) {
+    return null;
+  }
+
+  try {
+    const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}`);
+    url.searchParams.set("interval", "1m");
+    url.searchParams.set("range", "1d");
+
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        Accept: "application/json,text/plain,*/*",
+        Referer: "https://finance.yahoo.com/"
+      }
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = await response.json() as {
+      chart?: {
+        result?: Array<{
+          indicators?: {
+            quote?: Array<{
+              close?: unknown;
+            }>;
+          };
+        }>;
+      };
+    };
+
+    const closes = payload.chart?.result?.[0]?.indicators?.quote?.[0]?.close;
+    if (!Array.isArray(closes)) {
+      return null;
+    }
+
+    for (let index = closes.length - 1; index >= 0; index -= 1) {
+      const value = Number(closes[index]);
+      if (Number.isFinite(value) && value > 0) {
+        return value;
+      }
+    }
+  } catch {
+    // Fall through to null.
+  }
+
+  return null;
+}
+
 function timeframePlan(timeframe: ForexTimeframe): { resolution: string; bucket: number } {
   switch (timeframe) {
     case "1minute":
