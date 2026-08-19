@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { throwLiveDataUnavailable } from "../liveData.js";
 
 export type TrendDirection = "up" | "down";
 
@@ -140,7 +141,16 @@ const FOREX_SYMBOLS: Record<string, string> = {
   "GBP/JPY": "OANDA:GBP_JPY",
   "EUR/GBP": "OANDA:EUR_GBP",
   "AUD/JPY": "OANDA:AUD_JPY",
-  "CHF/JPY": "OANDA:CHF_JPY"
+  "CHF/JPY": "OANDA:CHF_JPY",
+  "EUR/AUD": "OANDA:EUR_AUD",
+  "GBP/AUD": "OANDA:GBP_AUD",
+  "AUD/NZD": "OANDA:AUD_NZD",
+  "EUR/NZD": "OANDA:EUR_NZD",
+  "CAD/JPY": "OANDA:CAD_JPY",
+  "GBP/NZD": "OANDA:GBP_NZD",
+  "NZD/JPY": "OANDA:NZD_JPY",
+  "AUD/CHF": "OANDA:AUD_CHF",
+  "EUR/CAD": "OANDA:EUR_CAD"
 };
 
 function timeframePlan(timeframe: ForexTimeframe): { resolution: string; bucket: number } {
@@ -266,6 +276,10 @@ export async function getForexCandles(
   }
 
   if (!config.FINNHUB_API_KEY) {
+    if (config.STRICT_LIVE_MODE) {
+      throwLiveDataUnavailable("Live forex candles unavailable", "FINNHUB_API_KEY is not configured");
+    }
+
     return {
       data: {},
       source: "fallback",
@@ -306,6 +320,10 @@ export async function getForexCandles(
     };
   }
 
+  if (config.STRICT_LIVE_MODE) {
+    throwLiveDataUnavailable("Live forex candles unavailable", "Live candle provider unavailable for requested range");
+  }
+
   return {
     data,
     source: "fallback",
@@ -323,12 +341,109 @@ function toDirection(changePercent: number): TrendDirection {
   return "down";
 }
 
+type YahooQuoteResult = {
+  symbol?: string;
+  regularMarketPrice?: number;
+  regularMarketChangePercent?: number;
+};
+
+async function fetchYahooTrends(): Promise<MarketTrend[] | null> {
+  const yahooSymbols = [
+    { code: "EURUSD=X", label: "EUR/USD", name: "Euro vs US Dollar", category: "forex" as const },
+    { code: "GBPUSD=X", label: "GBP/USD", name: "British Pound vs US Dollar", category: "forex" as const },
+    { code: "JPY=X", label: "USD/JPY", name: "US Dollar vs Japanese Yen", category: "forex" as const },
+    { code: "CHF=X", label: "USD/CHF", name: "US Dollar vs Swiss Franc", category: "forex" as const },
+    { code: "AUDUSD=X", label: "AUD/USD", name: "Australian Dollar vs US Dollar", category: "forex" as const },
+    { code: "NZDUSD=X", label: "NZD/USD", name: "New Zealand Dollar vs US Dollar", category: "forex" as const },
+    { code: "CAD=X", label: "USD/CAD", name: "US Dollar vs Canadian Dollar", category: "forex" as const },
+    { code: "EURGBP=X", label: "EUR/GBP", name: "Euro vs British Pound", category: "forex" as const },
+    { code: "EURJPY=X", label: "EUR/JPY", name: "Euro vs Japanese Yen", category: "forex" as const },
+    { code: "GBPJPY=X", label: "GBP/JPY", name: "British Pound vs Japanese Yen", category: "forex" as const },
+    { code: "AUDJPY=X", label: "AUD/JPY", name: "Australian Dollar vs Japanese Yen", category: "forex" as const },
+    { code: "CHFJPY=X", label: "CHF/JPY", name: "Swiss Franc vs Japanese Yen", category: "forex" as const },
+    { code: "GC=F", label: "XAU/USD", name: "Gold Spot", category: "commodity" as const },
+    { code: "SI=F", label: "XAG/USD", name: "Silver Spot", category: "commodity" as const },
+    { code: "BZ=F", label: "BRENT", name: "Crude Oil Brent", category: "oil" as const },
+    { code: "CL=F", label: "WTI", name: "Crude Oil WTI", category: "oil" as const }
+  ];
+
+  const url = new URL("https://query1.finance.yahoo.com/v7/finance/quote");
+  url.searchParams.set("symbols", yahooSymbols.map((item) => item.code).join(","));
+
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": "market-analysis-api"
+    }
+  });
+
+  if (!response.ok) {
+    return null;
+  }
+
+  const payload = (await response.json()) as {
+    quoteResponse?: {
+      result?: YahooQuoteResult[];
+    };
+  };
+
+  const map = new Map((payload.quoteResponse?.result ?? []).map((item) => [item.symbol, item]));
+
+  const trends = yahooSymbols
+    .map((symbol) => {
+      const quote = map.get(symbol.code);
+      const price = quote?.regularMarketPrice;
+      const changePercent = quote?.regularMarketChangePercent;
+
+      if (typeof price !== "number" || typeof changePercent !== "number") {
+        return null;
+      }
+
+      const direction = toDirection(changePercent);
+      const confidence = Math.max(55, Math.min(95, Math.round(Math.abs(changePercent) * 10 + 60)));
+
+      return {
+        symbol: symbol.label,
+        name: symbol.name,
+        category: symbol.category,
+        price,
+        changePercent,
+        direction,
+        momentum: direction === "up" ? "Up" : "Down",
+        momentumSuggestion: direction === "up" ? "Up" : "Down",
+        confidence
+      } satisfies MarketTrend;
+    })
+    .filter((item): item is MarketTrend => item !== null);
+
+  return trends.length > 0 ? trends : null;
+}
+
 export async function getMarketTrends(): Promise<MarketTrendsResponse> {
   if (!config.FINNHUB_API_KEY) {
+    try {
+      const yahoo = await fetchYahooTrends();
+      if (yahoo) {
+        return {
+          data: yahoo,
+          source: "live",
+          reason: "FINNHUB_API_KEY is not configured; using Yahoo Finance live quotes"
+        };
+      }
+    } catch {
+      // Fall through to fallback response below.
+    }
+
+    if (config.STRICT_LIVE_MODE) {
+      throwLiveDataUnavailable(
+        "Live market trends unavailable",
+        "FINNHUB_API_KEY is not configured and Yahoo Finance is unavailable"
+      );
+    }
+
     return {
       data: fallbackTrends,
       source: "fallback",
-      reason: "FINNHUB_API_KEY is not configured"
+      reason: "FINNHUB_API_KEY is not configured and Yahoo Finance is unavailable"
     };
   }
 
@@ -397,9 +512,26 @@ export async function getMarketTrends(): Promise<MarketTrendsResponse> {
     };
   }
 
+  try {
+    const yahoo = await fetchYahooTrends();
+    if (yahoo) {
+      return {
+        data: yahoo,
+        source: "live",
+        reason: "Finnhub unavailable; using Yahoo Finance live quotes"
+      };
+    }
+  } catch {
+    // Fall through to fallback response below.
+  }
+
+  if (config.STRICT_LIVE_MODE) {
+    throwLiveDataUnavailable("Live market trends unavailable", "Live quote providers unavailable");
+  }
+
   return {
     data: fallbackTrends,
     source: "fallback",
-    reason: "Live quote provider unavailable"
+    reason: "Live quote providers unavailable"
   };
 }

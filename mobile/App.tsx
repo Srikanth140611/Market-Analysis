@@ -2,16 +2,20 @@ import { useMemo, useState } from "react";
 import { SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, View, Pressable } from "react-native";
 import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import { GlobalUpdatesScreen } from "./src/screens/GlobalUpdatesScreen";
+import { HistoryScreen } from "./src/screens/HistoryScreen";
+import { AgentsScreen } from "./src/screens/AgentsScreen";
 import { TrendsScreen } from "./src/screens/TrendsScreen";
 import { BestSharesScreen } from "./src/screens/BestSharesScreen";
 import { SettingsScreen } from "./src/screens/SettingsScreen";
 import { theme } from "./src/theme";
 
-type TabKey = "updates" | "trends" | "shares" | "notify";
+type TabKey = "updates" | "trends" | "history" | "agents" | "shares" | "notify";
 
 const tabs: { key: TabKey; label: string }[] = [
   { key: "updates", label: "Updates" },
   { key: "trends", label: "Trends" },
+  { key: "history", label: "History" },
+  { key: "agents", label: "Agents" },
   { key: "shares", label: "Best Shares" },
   { key: "notify", label: "Slack" }
 ];
@@ -25,6 +29,12 @@ export default function App() {
     }
     if (activeTab === "trends") {
       return <TrendsScreen />;
+    }
+    if (activeTab === "history") {
+      return <HistoryScreen />;
+    }
+    if (activeTab === "agents") {
+      return <AgentsScreen />;
     }
     if (activeTab === "shares") {
       return <BestSharesScreen />;

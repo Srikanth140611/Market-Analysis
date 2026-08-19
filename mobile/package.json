@@ -6,8 +6,15 @@
   "scripts": {
     "start": "expo start",
     "android": "expo run:android",
+    "android:start": "expo start --android",
     "ios": "expo run:ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "web:prod": "set EXPO_PUBLIC_API_BASE_URL=https://qhpokqaxb234i7pk7ubxjmywkq0nugeq.lambda-url.ap-southeast-2.on.aws&& expo start --web --no-dev --minify",
+    "export:web": "set EXPO_PUBLIC_API_BASE_URL=https://qhpokqaxb234i7pk7ubxjmywkq0nugeq.lambda-url.ap-southeast-2.on.aws&& expo export --platform web --output-dir dist-gh-pages && node scripts/prepare-gh-pages.cjs",
+    "deploy:gh-pages": "npm run export:web && npx gh-pages -d dist-gh-pages --dotfiles",
+    "eas:login": "eas login",
+    "build:android": "eas build --platform android --profile production",
+    "build:ios": "eas build --platform ios --profile production"
   },
   "dependencies": {
     "@expo/metro-runtime": "~3.2.3",
@@ -20,6 +27,7 @@
   },
   "devDependencies": {
     "@types/react": "~18.2.79",
+    "eas-cli": "^21.5.0",
     "typescript": "~5.3.3"
   }
 }

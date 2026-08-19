@@ -104,3 +104,139 @@ export type ForexCandlesResponse = {
   timeframe: ForexTimeframe;
   years: number;
 };
+
+export type MarketHistoryTimeframe = "1minute" | "5minute" | "1hour" | "4hour" | "8hour" | "12hour" | "1Day" | "1Week";
+
+export type MarketHistorySource = "live" | "derived" | "fallback" | "mixed";
+
+export type MarketPatternKind = "trend" | "range" | "breakout" | "reversal" | "momentum" | "compression";
+
+export type MarketPatternSignal = {
+  symbol: string;
+  name: string;
+  category: "forex" | "commodity" | "oil";
+  timeframe: MarketHistoryTimeframe;
+  pattern: MarketPatternKind;
+  direction: "up" | "down" | "neutral";
+  confidence: number;
+  support: number;
+  resistance: number;
+  latestClose: number;
+  sampleSize: number;
+  source: MarketHistorySource;
+  note: string;
+};
+
+export type MarketHistoryFrame = {
+  candles: OhlcCandle[];
+  source: MarketHistorySource;
+  note?: string;
+};
+
+export type MarketHistoryResponse = {
+  data: Record<string, Partial<Record<MarketHistoryTimeframe, MarketHistoryFrame>>>;
+  patterns: MarketPatternSignal[];
+  source: MarketHistorySource;
+  reason?: string;
+  years: number;
+  timeframes: MarketHistoryTimeframe[];
+};
+
+export type MarketAgentName = "Forex" | "Commodities" | "Oil";
+
+export type MarketAgentTradePlan = {
+  entry: number;
+  stopLoss: number;
+  takeProfit: number;
+  trailingStopLoss: number;
+  trailingStopPercent: number;
+  riskRewardRatio: number;
+};
+
+export type MarketAgentTechnicalAnalysis = {
+  ema20: number;
+  ema50: number;
+  sma50: number;
+  bollingerUpper: number;
+  bollingerMiddle: number;
+  bollingerLower: number;
+  bollingerWidthPercent: number;
+  macdLine: number;
+  macdSignal: number;
+  macdHistogram: number;
+  support: number;
+  resistance: number;
+  volatilityPercent: number;
+  trendStrength: number;
+  summary: string;
+};
+
+export type MarketAgentFundamentalAnalysis = {
+  bias: "bullish" | "bearish" | "neutral";
+  macroScore: number;
+  summary: string;
+  drivers: string[];
+  risks: string[];
+  catalystWindow: string;
+};
+
+export type MarketAgentDeepDiveDimension = {
+  skillDimensions: string[];
+  confluenceScore: number;
+  setupQuality: "high" | "medium" | "watchlist";
+  technicalFocus: string[];
+  fundamentalFocus: string[];
+};
+
+export type MarketAgentTimeframeSignal = {
+  timeframe: MarketHistoryTimeframe;
+  pattern: MarketPatternKind;
+  confidence: number;
+  direction: "up" | "down" | "neutral";
+  currentPrice: number;
+  lastOccurrenceAt: string;
+  source: MarketHistorySource;
+  strategySummary: string;
+  strategiesApplied: string[];
+  tradePlan: MarketAgentTradePlan;
+  support: number;
+  resistance: number;
+  note: string;
+  technicals: MarketAgentTechnicalAnalysis;
+  fundamentals: MarketAgentFundamentalAnalysis;
+  deepDive: MarketAgentDeepDiveDimension;
+};
+
+export type MarketAgentSymbolReport = {
+  symbol: string;
+  name: string;
+  currentPrice: number;
+  bestSignal: MarketAgentTimeframeSignal;
+  timeframeSignals: MarketAgentTimeframeSignal[];
+};
+
+export type MarketAgentReport = {
+  agent: MarketAgentName;
+  category: "forex" | "commodity" | "oil";
+  symbols: MarketAgentSymbolReport[];
+  bestSignal: MarketAgentTimeframeSignal;
+  summary: string;
+  strategySummary: string;
+  deepDive: MarketAgentDeepDiveDimension;
+  rag: {
+    context: string;
+    documents: string[];
+  };
+  knowledgeGraph: {
+    nodes: string[];
+    edges: string[];
+  };
+  generatedAt: string;
+};
+
+export type MarketAgentsResponse = {
+  data: MarketAgentReport[];
+  source: MarketHistorySource;
+  reason?: string;
+  generatedAt: string;
+};

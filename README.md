@@ -90,6 +90,58 @@ npm run dev:mobile
 
 For Android emulator or device, update `mobile/src/constants.ts` API base URL from localhost to your machine LAN IP if needed.
 
+## Android Studio Workflow (Recommended)
+
+This project is Expo + React Native, so a practical setup is:
+- Use VS Code for code changes
+- Use Android Studio emulator/device for real Android validation
+
+### 1. Start backend API
+
+```powershell
+npm run dev:api
+```
+
+### 2. Run on Android emulator via native build
+
+```powershell
+npm run dev:android
+```
+
+Use this when you want Android-native behavior validation (performance, networking, notifications, release-like behavior).
+
+### 3. Fast iteration using Expo Go on emulator
+
+```powershell
+npm run dev:android-go
+```
+
+### 4. API base URL behavior
+
+`mobile/src/constants.ts` now defaults automatically to:
+- Android: `http://10.0.2.2:8080`
+- Web/iOS: `http://localhost:8080`
+
+You can override in any environment using:
+
+```powershell
+$env:EXPO_PUBLIC_API_BASE_URL="http://<YOUR_LAN_IP>:8080"
+```
+
+Then run app commands in the same terminal session.
+
+### 5. Pre-release Android checklist
+
+- Verify Updates, Trends, Best Shares render without fallback regressions
+- Verify fullscreen forex chart interactions on emulator/device
+- Verify Slack test notification from app settings
+- Verify API `/health` and `/api/news/global` responsiveness under polling
+- Build once with `npm run dev:android` after cleaning emulator cache if needed
+
+## Figma Design Handoff
+
+If you share your Figma frame specs (spacing, typography, colors, component states), we can map them 1:1 into this codebase quickly. In this environment I can implement from exported tokens/spec screenshots and keep the React Native styles consistent across web + Android.
+
 ## Notes
 
 - No API keys? The app still works with curated fallback sample data.

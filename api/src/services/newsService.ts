@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { config } from "../config.js";
+import { throwLiveDataUnavailable } from "../liveData.js";
 import { getMarketTrends } from "./marketService.js";
 
 export type NewsItem = {
@@ -495,6 +496,10 @@ export async function getGlobalMarketNews(): Promise<NewsFeedResponse> {
   const noKeys = !config.MARKETAUX_API_KEY && !config.FINNHUB_API_KEY;
   if (noKeys) {
     reasons.push("MARKETAUX_API_KEY and FINNHUB_API_KEY are not configured");
+  }
+
+  if (config.STRICT_LIVE_MODE) {
+    throwLiveDataUnavailable("Live global news unavailable", reasons.join("; "));
   }
 
   return {

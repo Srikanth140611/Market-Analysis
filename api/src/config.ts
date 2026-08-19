@@ -15,6 +15,10 @@ const schema = z.object({
     .string()
     .optional()
     .transform((value) => value !== "false"),
+  STRICT_LIVE_MODE: z
+    .string()
+    .optional()
+    .transform((value) => value === "true"),
   NEWS_POLL_INTERVAL_MS: z.coerce.number().default(60_000),
   ALLOWED_ORIGIN: z.string().default("*")
 });

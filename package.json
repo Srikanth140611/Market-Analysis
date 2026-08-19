@@ -8,6 +8,8 @@
   "scripts": {
     "dev:api": "npm --workspace api run dev",
     "dev:mobile": "npm --workspace mobile run start",
+    "dev:android": "npm --workspace mobile run android",
+    "dev:android-go": "npm --workspace mobile run android:start",
     "build": "npm --workspace api run build"
   }
 }

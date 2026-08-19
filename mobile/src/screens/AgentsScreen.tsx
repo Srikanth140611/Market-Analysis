@@ -1,0 +1,645 @@
+import { useState } from "react";
+import { Pressable, StyleSheet, Text, View } from "react-native";
+import { fetchMarketAgents } from "../api/client";
+import { REFRESH_INTERVAL_MS } from "../constants";
+import { usePollingData } from "../hooks/usePollingData";
+import { theme } from "../theme";
+import { SectionCard } from "../components/SectionCard";
+import { MarketAgentReport, MarketAgentTimeframeSignal } from "../types";
+
+const TIMEFRAME_ORDER: Record<string, number> = {
+  "1minute": 1,
+  "5minute": 2,
+  "1hour": 3,
+  "4hour": 4,
+  "8hour": 5,
+  "12hour": 6,
+  "1Day": 7,
+  "1Week": 8
+};
+
+function sourceColor(source: string) {
+  if (source === "live") {
+    return theme.colors.positive;
+  }
+
+  if (source === "derived") {
+    return theme.colors.warning;
+  }
+
+  if (source === "mixed") {
+    return theme.colors.accent;
+  }
+
+  return theme.colors.negative;
+}
+
+function directionColor(direction: string) {
+  if (direction === "up") {
+    return theme.colors.positive;
+  }
+
+  if (direction === "down") {
+    return theme.colors.negative;
+  }
+
+  return theme.colors.warning;
+}
+
+function formatPrice(value: number) {
+  return value > 20 ? value.toFixed(2) : value.toFixed(4);
+}
+
+function formatSigned(value: number, decimals = 2) {
+  const prefix = value > 0 ? "+" : "";
+  return `${prefix}${value.toFixed(decimals)}`;
+}
+
+function formatTimestamp(timestamp: string) {
+  return new Date(timestamp).toLocaleString([], {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function estimateSellPrice(signal: MarketAgentTimeframeSignal) {
+  const spreadRatio = Math.max(0.00005, Math.min(0.0025, signal.technicals.volatilityPercent / 100 / 8));
+  return signal.currentPrice * (1 - spreadRatio);
+}
+
+function confidenceNarrative(signal: MarketAgentTimeframeSignal) {
+  const pieces = [
+    `${signal.pattern.toUpperCase()} pattern confidence ${signal.confidence}%`,
+    `Confluence ${signal.deepDive.confluenceScore}`,
+    `MACD histogram ${formatSigned(signal.technicals.macdHistogram, 4)}`,
+    `EMA20 vs EMA50 ${formatPrice(signal.technicals.ema20)} / ${formatPrice(signal.technicals.ema50)}`,
+    `Fundamental bias ${signal.fundamentals.bias.toUpperCase()} (${signal.fundamentals.macroScore})`
+  ];
+  return pieces.join(" | ");
+}
+
+function AgentSignalCard({ signal }: { signal: MarketAgentTimeframeSignal }) {
+  return (
+    <View style={styles.signalCard}>
+      <View style={styles.signalTopRow}>
+        <Text style={styles.signalTimeframe}>{signal.timeframe}</Text>
+        <Text style={[styles.signalDirection, { color: directionColor(signal.direction) }]}>
+          {signal.pattern.toUpperCase()} | {signal.direction.toUpperCase()} | {signal.confidence}%
+        </Text>
+      </View>
+      <Text style={styles.signalMeta}>Occurred {formatTimestamp(signal.lastOccurrenceAt)}</Text>
+      <Text style={styles.signalMeta}>Price {formatPrice(signal.currentPrice)} | Source {signal.source}</Text>
+      <Text style={styles.signalNote}>{signal.strategySummary}</Text>
+      <Text style={styles.signalNote}>
+        Entry {formatPrice(signal.tradePlan.entry)} | SL {formatPrice(signal.tradePlan.stopLoss)} | TP {formatPrice(signal.tradePlan.takeProfit)} | Trailing SL {formatPrice(signal.tradePlan.trailingStopLoss)}
+      </Text>
+      <Text style={styles.signalMeta}>RR {signal.tradePlan.riskRewardRatio.toFixed(2)} | Trail {signal.tradePlan.trailingStopPercent.toFixed(2)}%</Text>
+      <Text style={styles.signalMeta}>
+        EMA20 {formatPrice(signal.technicals.ema20)} | EMA50 {formatPrice(signal.technicals.ema50)} | SMA50 {formatPrice(signal.technicals.sma50)}
+      </Text>
+      <Text style={styles.signalMeta}>
+        MACD {formatSigned(signal.technicals.macdLine, 4)} / Signal {formatSigned(signal.technicals.macdSignal, 4)} / Hist {formatSigned(signal.technicals.macdHistogram, 4)}
+      </Text>
+      <Text style={styles.signalMeta}>
+        Bollinger U {formatPrice(signal.technicals.bollingerUpper)} | M {formatPrice(signal.technicals.bollingerMiddle)} | L {formatPrice(signal.technicals.bollingerLower)}
+      </Text>
+      <Text style={styles.signalMeta}>
+        Vol {signal.technicals.volatilityPercent.toFixed(2)}% | Trend strength {signal.technicals.trendStrength.toFixed(2)} | Confluence {signal.deepDive.confluenceScore}
+      </Text>
+      <Text style={styles.signalMeta}>Fundamental bias {signal.fundamentals.bias.toUpperCase()} | Macro {signal.fundamentals.macroScore}</Text>
+      <Text style={styles.signalNote}>{signal.fundamentals.summary}</Text>
+      <Text style={styles.signalMeta}>Drivers: {signal.fundamentals.drivers.join(" | ")}</Text>
+      <Text style={styles.signalMeta}>Risks: {signal.fundamentals.risks.join(" | ")}</Text>
+      <Text style={styles.signalMeta}>Catalyst window: {signal.fundamentals.catalystWindow}</Text>
+      <Text style={styles.signalStrategies}>Strategies: {signal.strategiesApplied.join(" | ")}</Text>
+    </View>
+  );
+}
+
+function AgentCard({
+  agent,
+  expandedSymbols,
+  onToggleSymbol,
+  selectedAnalysisKey,
+  onToggleAnalysis
+}: {
+  agent: MarketAgentReport;
+  expandedSymbols: Record<string, boolean>;
+  onToggleSymbol: (key: string) => void;
+  selectedAnalysisKey: string | null;
+  onToggleAnalysis: (key: string) => void;
+}) {
+  const isForexAgent = agent.agent === "Forex";
+
+  return (
+    <View style={styles.agentCard}>
+      <View style={styles.agentHeader}>
+        <View>
+          <Text style={styles.agentLabel}>{agent.agent}</Text>
+          <Text style={styles.agentSubtitle}>{agent.category.toUpperCase()} agent</Text>
+        </View>
+        <Text style={[styles.sourceBadge, { color: sourceColor(agent.bestSignal.source) }]}>
+          {agent.bestSignal.source}
+        </Text>
+      </View>
+
+      <Text style={[styles.bestSignal, { color: directionColor(agent.bestSignal.direction) }]}>
+        Best: {agent.bestSignal.pattern.toUpperCase()} on {agent.bestSignal.timeframe} | {agent.bestSignal.confidence}%
+      </Text>
+      <Text style={styles.description}>{agent.summary}</Text>
+      <Text style={styles.description}>{agent.strategySummary}</Text>
+      <Text style={styles.description}>Setup quality {agent.deepDive.setupQuality.toUpperCase()} | Confluence {agent.deepDive.confluenceScore}</Text>
+
+      <View style={styles.kpiRow}>
+        <Text style={styles.kpi}>Support {formatPrice(agent.bestSignal.support)}</Text>
+        <Text style={styles.kpi}>Resistance {formatPrice(agent.bestSignal.resistance)}</Text>
+        <Text style={styles.kpi}>Occurred {formatTimestamp(agent.bestSignal.lastOccurrenceAt)}</Text>
+      </View>
+
+      <Text style={styles.riskText}>
+        Entry {formatPrice(agent.bestSignal.tradePlan.entry)} | SL {formatPrice(agent.bestSignal.tradePlan.stopLoss)} | TP {formatPrice(agent.bestSignal.tradePlan.takeProfit)} | Trailing SL {formatPrice(agent.bestSignal.tradePlan.trailingStopLoss)}
+      </Text>
+
+      <View style={styles.placeholderRow}>
+        <Text style={styles.placeholderTitle}>Technical Deep Dive</Text>
+        <Text style={styles.placeholderText}>{agent.bestSignal.technicals.summary}</Text>
+        <Text style={styles.placeholderText}>Focus: {agent.deepDive.technicalFocus.join(" | ")}</Text>
+        <Text style={styles.placeholderTitle}>Fundamental Deep Dive</Text>
+        <Text style={styles.placeholderText}>{agent.bestSignal.fundamentals.summary}</Text>
+        <Text style={styles.placeholderText}>Drivers: {agent.bestSignal.fundamentals.drivers.join(" | ")}</Text>
+        <Text style={styles.placeholderText}>Risks: {agent.bestSignal.fundamentals.risks.join(" | ")}</Text>
+        <Text style={styles.placeholderText}>Catalyst window: {agent.bestSignal.fundamentals.catalystWindow}</Text>
+      </View>
+
+      {isForexAgent ? (
+        <View style={styles.forexTableBlock}>
+          <Text style={styles.forexTableTitle}>Forex Live Signals Agent</Text>
+          <View style={styles.forexTableHeaderRow}>
+            <Text style={[styles.forexHeaderCell, styles.cellPair]}>Currency Pair</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Live Buy Price</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Live Sell Price</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellTimeframe]}>Time Frame</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellTrend]}>Trend</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellSignal]}>Signal</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellConfidence]}>Confidence</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Entry</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Stop loss</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Take profit</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellAnalysis]}>Analysis</Text>
+          </View>
+
+          {agent.symbols.map((symbol) => {
+            const signal = symbol.bestSignal;
+            const analysisKey = `${agent.agent}:${symbol.symbol}:${signal.timeframe}`;
+            const analysisOpen = selectedAnalysisKey === analysisKey;
+
+            return (
+              <View key={symbol.symbol} style={styles.forexRowWrap}>
+                <View style={styles.forexTableRow}>
+                  <Text style={[styles.forexCell, styles.cellPair]}>{symbol.symbol}</Text>
+                  <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(signal.currentPrice)}</Text>
+                  <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(estimateSellPrice(signal))}</Text>
+                  <Text style={[styles.forexCell, styles.cellTimeframe]}>{signal.timeframe}</Text>
+                  <Text style={[styles.forexCell, styles.cellTrend, { color: directionColor(signal.direction) }]}>{signal.direction.toUpperCase()}</Text>
+                  <Text style={[styles.forexCell, styles.cellSignal]}>{signal.pattern.toUpperCase()}</Text>
+                  <Text style={[styles.forexCell, styles.cellConfidence]}>{signal.confidence}%</Text>
+                  <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(signal.tradePlan.entry)}</Text>
+                  <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(signal.tradePlan.stopLoss)}</Text>
+                  <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(signal.tradePlan.takeProfit)}</Text>
+                  <Pressable
+                    style={[styles.analysisButton, analysisOpen ? styles.analysisButtonActive : null]}
+                    onPress={() => onToggleAnalysis(analysisKey)}
+                  >
+                    <Text style={[styles.analysisButtonText, analysisOpen ? styles.analysisButtonTextActive : null]}>
+                      {analysisOpen ? "Hide" : "View"}
+                    </Text>
+                  </Pressable>
+                </View>
+
+                {analysisOpen ? (
+                  <View style={styles.analysisPanel}>
+                    <Text style={styles.analysisTitle}>{symbol.symbol} analysis</Text>
+                    <Text style={styles.analysisText}>{confidenceNarrative(signal)}</Text>
+                    <Text style={styles.analysisText}>Strategies: {signal.strategiesApplied.join(" | ")}</Text>
+                    <Text style={styles.analysisText}>Technical: {signal.technicals.summary}</Text>
+                    <Text style={styles.analysisText}>Fundamental: {signal.fundamentals.summary}</Text>
+                  </View>
+                ) : null}
+              </View>
+            );
+          })}
+        </View>
+      ) : (
+        <View style={styles.symbolBlock}>
+          {agent.symbols.map((symbol) => (
+            <View key={symbol.symbol} style={styles.symbolCard}>
+            <View style={styles.symbolHeader}>
+              <Text style={styles.symbol}>{symbol.symbol}</Text>
+              <Text style={styles.symbolPrice}>{formatPrice(symbol.currentPrice)}</Text>
+            </View>
+            <Text style={styles.symbolMeta}>Best timeframe {symbol.bestSignal.timeframe}</Text>
+            <Text style={styles.symbolMeta}>
+              {symbol.bestSignal.pattern.toUpperCase()} | {symbol.bestSignal.direction.toUpperCase()} | {symbol.bestSignal.confidence}%
+            </Text>
+            <Text style={styles.symbolMeta}>Occurred {formatTimestamp(symbol.bestSignal.lastOccurrenceAt)}</Text>
+            <Text style={styles.symbolMeta}>
+              Entry {formatPrice(symbol.bestSignal.tradePlan.entry)} | SL {formatPrice(symbol.bestSignal.tradePlan.stopLoss)} | TP {formatPrice(symbol.bestSignal.tradePlan.takeProfit)}
+            </Text>
+            <Text style={styles.symbolMeta}>
+              EMA20 {formatPrice(symbol.bestSignal.technicals.ema20)} | EMA50 {formatPrice(symbol.bestSignal.technicals.ema50)} | SMA50 {formatPrice(symbol.bestSignal.technicals.sma50)}
+            </Text>
+            <Text style={styles.symbolMeta}>
+              MACD Hist {formatSigned(symbol.bestSignal.technicals.macdHistogram, 4)} | Boll width {symbol.bestSignal.technicals.bollingerWidthPercent.toFixed(2)}%
+            </Text>
+            <Text style={styles.symbolMeta}>
+              Fundamental {symbol.bestSignal.fundamentals.bias.toUpperCase()} | Macro {symbol.bestSignal.fundamentals.macroScore} | Setup {symbol.bestSignal.deepDive.setupQuality.toUpperCase()}
+            </Text>
+
+            {(() => {
+              const symbolKey = `${agent.agent}:${symbol.symbol}`;
+              const isExpanded = expandedSymbols[symbolKey] ?? false;
+              const orderedSignals = [...symbol.timeframeSignals].sort((left, right) => {
+                const leftOrder = TIMEFRAME_ORDER[left.timeframe] ?? 999;
+                const rightOrder = TIMEFRAME_ORDER[right.timeframe] ?? 999;
+                return leftOrder - rightOrder;
+              });
+
+              return (
+                <View style={styles.timeframePanel}>
+                  <Pressable
+                    onPress={() => onToggleSymbol(symbolKey)}
+                    style={[styles.toggleButton, isExpanded ? styles.toggleButtonActive : null]}
+                  >
+                    <Text style={[styles.toggleText, isExpanded ? styles.toggleTextActive : null]}>
+                      {isExpanded ? "Hide timeframe details" : `Show all ${orderedSignals.length} timeframes`}
+                    </Text>
+                  </Pressable>
+
+                  {isExpanded
+                    ? orderedSignals.map((timeframeSignal) => (
+                      <AgentSignalCard
+                        key={`${symbol.symbol}:${timeframeSignal.timeframe}`}
+                        signal={timeframeSignal}
+                      />
+                    ))
+                    : <AgentSignalCard signal={symbol.bestSignal} />}
+                </View>
+              );
+            })()}
+            </View>
+          ))}
+        </View>
+      )}
+
+      <View style={styles.placeholderRow}>
+        <Text style={styles.placeholderTitle}>RAG</Text>
+        <Text style={styles.placeholderText}>{agent.rag.context}</Text>
+        <Text style={styles.placeholderText}>Dimensions: {agent.deepDive.skillDimensions.join(" | ")}</Text>
+        <Text style={styles.placeholderText}>Fundamental focus: {agent.deepDive.fundamentalFocus.join(" | ")}</Text>
+        <Text style={styles.placeholderTitle}>Knowledge Graph</Text>
+        <Text style={styles.placeholderText}>Nodes: {agent.knowledgeGraph.nodes.join(", ")}</Text>
+        <Text style={styles.placeholderText}>Edges: {agent.knowledgeGraph.edges.join(" | ")}</Text>
+      </View>
+    </View>
+  );
+}
+
+export function AgentsScreen() {
+  const { data, loading, error } = usePollingData(fetchMarketAgents, REFRESH_INTERVAL_MS);
+  const [expandedSymbols, setExpandedSymbols] = useState<Record<string, boolean>>({});
+  const [selectedAnalysisKey, setSelectedAnalysisKey] = useState<string | null>(null);
+
+  const toggleSymbol = (key: string) => {
+    setExpandedSymbols((previous) => ({
+      ...previous,
+      [key]: !previous[key]
+    }));
+  };
+
+  const toggleAnalysis = (key: string) => {
+    setSelectedAnalysisKey((previous) => (previous === key ? null : key));
+  };
+
+  return (
+    <View>
+      <SectionCard title="3 Analysis Agents" subtitle="Forex, Commodities and Oil pattern intelligence with strategy levels">
+        {loading ? <Text style={styles.muted}>Loading agent analysis...</Text> : null}
+        {error ? <Text style={styles.error}>{error}</Text> : null}
+        {data ? (
+          <Text style={[styles.source, { color: sourceColor(data.source) }]}>Source: {data.source}{data.reason ? ` (${data.reason})` : ""}</Text>
+        ) : null}
+
+        {(data?.data ?? []).map((agent) => (
+          <AgentCard
+            key={agent.agent}
+            agent={agent}
+            expandedSymbols={expandedSymbols}
+            onToggleSymbol={toggleSymbol}
+            selectedAnalysisKey={selectedAnalysisKey}
+            onToggleAnalysis={toggleAnalysis}
+          />
+        ))}
+      </SectionCard>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  muted: {
+    color: theme.colors.muted,
+    marginBottom: 8
+  },
+  error: {
+    color: theme.colors.negative,
+    marginBottom: 8
+  },
+  source: {
+    marginBottom: 10,
+    fontSize: 12,
+    fontWeight: "700"
+  },
+  agentCard: {
+    borderWidth: 1,
+    borderColor: "#1f4358",
+    backgroundColor: "#0e2230",
+    borderRadius: 16,
+    padding: 12,
+    marginBottom: 12
+  },
+  agentHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start"
+  },
+  agentLabel: {
+    color: theme.colors.text,
+    fontSize: 17,
+    fontWeight: "800"
+  },
+  agentSubtitle: {
+    color: theme.colors.muted,
+    marginTop: 2,
+    fontSize: 12
+  },
+  sourceBadge: {
+    fontSize: 11,
+    fontWeight: "800",
+    textTransform: "uppercase"
+  },
+  bestSignal: {
+    marginTop: 8,
+    fontWeight: "800"
+  },
+  description: {
+    color: theme.colors.text,
+    marginTop: 6,
+    fontSize: 12,
+    lineHeight: 17
+  },
+  kpiRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 10
+  },
+  kpi: {
+    color: theme.colors.muted,
+    fontSize: 12,
+    fontWeight: "700"
+  },
+  riskText: {
+    color: theme.colors.accent,
+    marginTop: 10,
+    fontSize: 12,
+    fontWeight: "700"
+  },
+  symbolBlock: {
+    marginTop: 10,
+    gap: 8
+  },
+  symbolCard: {
+    backgroundColor: "#123246",
+    borderWidth: 1,
+    borderColor: "#24566f",
+    borderRadius: 12,
+    padding: 10
+  },
+  symbolHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between"
+  },
+  symbol: {
+    color: theme.colors.text,
+    fontWeight: "800"
+  },
+  symbolPrice: {
+    color: theme.colors.text,
+    fontWeight: "800"
+  },
+  symbolMeta: {
+    color: theme.colors.muted,
+    marginTop: 2,
+    fontSize: 12
+  },
+  forexTableBlock: {
+    marginTop: 12,
+    borderWidth: 1,
+    borderColor: "#24566f",
+    borderRadius: 12,
+    overflow: "hidden"
+  },
+  forexTableTitle: {
+    color: theme.colors.text,
+    fontWeight: "800",
+    fontSize: 13,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    backgroundColor: "#102b3b"
+  },
+  forexTableHeaderRow: {
+    flexDirection: "row",
+    backgroundColor: "#0b1d29",
+    borderTopWidth: 1,
+    borderColor: "#17384b"
+  },
+  forexTableRow: {
+    flexDirection: "row",
+    backgroundColor: "#102b3b",
+    borderTopWidth: 1,
+    borderColor: "#17384b",
+    alignItems: "center"
+  },
+  forexRowWrap: {
+    backgroundColor: "#102b3b"
+  },
+  forexHeaderCell: {
+    color: theme.colors.accent,
+    fontSize: 11,
+    fontWeight: "800",
+    paddingHorizontal: 6,
+    paddingVertical: 8
+  },
+  forexCell: {
+    color: theme.colors.text,
+    fontSize: 11,
+    paddingHorizontal: 6,
+    paddingVertical: 8
+  },
+  cellPair: {
+    flex: 1.3
+  },
+  cellPrice: {
+    flex: 1.3
+  },
+  cellTimeframe: {
+    flex: 1.1
+  },
+  cellTrend: {
+    flex: 0.9,
+    fontWeight: "700"
+  },
+  cellSignal: {
+    flex: 0.9,
+    fontWeight: "700"
+  },
+  cellConfidence: {
+    flex: 0.9,
+    fontWeight: "700"
+  },
+  cellAnalysis: {
+    flex: 1,
+    textAlign: "center"
+  },
+  analysisButton: {
+    flex: 1,
+    marginHorizontal: 6,
+    marginVertical: 4,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#24566f",
+    backgroundColor: "#0b1d29"
+  },
+  analysisButtonActive: {
+    backgroundColor: theme.colors.accent,
+    borderColor: theme.colors.accent
+  },
+  analysisButtonText: {
+    color: theme.colors.text,
+    fontSize: 11,
+    fontWeight: "700",
+    textAlign: "center"
+  },
+  analysisButtonTextActive: {
+    color: "#03222f"
+  },
+  analysisPanel: {
+    borderTopWidth: 1,
+    borderColor: "#17384b",
+    backgroundColor: "#0b1d29",
+    paddingHorizontal: 10,
+    paddingVertical: 8
+  },
+  analysisTitle: {
+    color: theme.colors.accent,
+    fontWeight: "800",
+    fontSize: 12,
+    marginBottom: 4
+  },
+  analysisText: {
+    color: theme.colors.muted,
+    fontSize: 11,
+    lineHeight: 15,
+    marginBottom: 3
+  },
+  timeframePanel: {
+    marginTop: 8
+  },
+  toggleButton: {
+    alignSelf: "flex-start",
+    backgroundColor: "#0b1d29",
+    borderWidth: 1,
+    borderColor: "#24566f",
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    marginTop: 6,
+    marginBottom: 4
+  },
+  toggleButtonActive: {
+    backgroundColor: theme.colors.accent,
+    borderColor: theme.colors.accent
+  },
+  toggleText: {
+    color: theme.colors.text,
+    fontSize: 11,
+    fontWeight: "700"
+  },
+  toggleTextActive: {
+    color: "#03222f"
+  },
+  placeholderRow: {
+    marginTop: 10,
+    backgroundColor: "#0b1d29",
+    borderRadius: 12,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: "#17384b"
+  },
+  placeholderTitle: {
+    color: theme.colors.accent,
+    fontWeight: "800",
+    marginTop: 2,
+    marginBottom: 3
+  },
+  placeholderText: {
+    color: theme.colors.muted,
+    fontSize: 12,
+    lineHeight: 16,
+    marginBottom: 2
+  },
+  signalCard: {
+    backgroundColor: "#102b3b",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#1f4358",
+    padding: 10,
+    marginTop: 8
+  },
+  signalTopRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    gap: 8
+  },
+  signalTimeframe: {
+    color: theme.colors.text,
+    fontWeight: "800",
+    textTransform: "uppercase",
+    fontSize: 12
+  },
+  signalDirection: {
+    fontWeight: "800",
+    fontSize: 12,
+    textAlign: "right"
+  },
+  signalMeta: {
+    color: theme.colors.muted,
+    marginTop: 3,
+    fontSize: 12
+  },
+  signalNote: {
+    color: theme.colors.text,
+    marginTop: 6,
+    fontSize: 12,
+    lineHeight: 16
+  },
+  signalStrategies: {
+    color: theme.colors.accent,
+    marginTop: 6,
+    fontSize: 12,
+    lineHeight: 16,
+    fontWeight: "700"
+  }
+});

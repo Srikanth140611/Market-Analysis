@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { throwLiveDataUnavailable } from "../liveData.js";
 
 export type StockSuggestion = {
   symbol: string;
@@ -88,6 +89,12 @@ type FinnhubSentiment = {
     buzz?: number;
     weeklyAverage?: number;
   };
+};
+
+type YahooQuoteResult = {
+  symbol?: string;
+  regularMarketPrice?: number;
+  regularMarketChangePercent?: number;
 };
 
 const universe: UniverseStock[] = [
@@ -219,10 +226,96 @@ async function getAlphaVantageSuggestions(): Promise<StockSuggestion[] | null> {
   }
 }
 
+async function getYahooSuggestions(): Promise<StockSuggestion[] | null> {
+  const url = new URL("https://query1.finance.yahoo.com/v7/finance/quote");
+  url.searchParams.set("symbols", universe.map((stock) => stock.symbol).join(","));
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "market-analysis-api"
+      }
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = (await response.json()) as {
+      quoteResponse?: {
+        result?: YahooQuoteResult[];
+      };
+    };
+
+    const quoteBySymbol = new Map((payload.quoteResponse?.result ?? []).map((item) => [item.symbol, item]));
+
+    const suggestions = universe
+      .map((stock) => {
+        const quote = quoteBySymbol.get(stock.symbol);
+        const price = quote?.regularMarketPrice;
+        const changePercent = quote?.regularMarketChangePercent;
+
+        if (typeof price !== "number" || typeof changePercent !== "number") {
+          return null;
+        }
+
+        const momentum = scoreMomentum(changePercent);
+        const volatility = 58;
+        const sentiment = 55;
+        const participation = 52;
+        const score = momentum * 0.65 + volatility * 0.15 + sentiment * 0.1 + participation * 0.1;
+
+        return {
+          symbol: stock.symbol,
+          name: stock.name,
+          sector: stock.sector,
+          price,
+          changePercent,
+          score: Number(score.toFixed(1)),
+          factorScores: {
+            momentum: Number(momentum.toFixed(1)),
+            volatility,
+            sentiment,
+            participation
+          },
+          rationale: buildRationale({
+            momentum,
+            volatility,
+            sentiment,
+            participation
+          })
+        } satisfies StockSuggestion;
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null)
+      .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+      .slice(0, 5);
+
+    return suggestions.length > 0 ? suggestions : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function getBestShares(): Promise<StockSuggestion[]> {
   if (!config.FINNHUB_API_KEY) {
+    const yahoo = await getYahooSuggestions();
+    if (yahoo) {
+      return yahoo;
+    }
+
     const alpha = await getAlphaVantageSuggestions();
-    return alpha ?? fallbackSuggestions;
+    if (alpha) {
+      return alpha;
+    }
+
+    if (config.STRICT_LIVE_MODE) {
+      throwLiveDataUnavailable(
+        "Live best shares unavailable",
+        "FINNHUB_API_KEY is not configured, and Yahoo/Alpha Vantage providers are unavailable"
+      );
+    }
+
+    return fallbackSuggestions;
   }
 
   try {
@@ -316,10 +409,36 @@ export async function getBestShares(): Promise<StockSuggestion[]> {
       return ranked;
     }
 
+    const yahoo = await getYahooSuggestions();
+    if (yahoo) {
+      return yahoo;
+    }
+
     const alpha = await getAlphaVantageSuggestions();
-    return alpha ?? fallbackSuggestions;
+    if (alpha) {
+      return alpha;
+    }
+
+    if (config.STRICT_LIVE_MODE) {
+      throwLiveDataUnavailable("Live best shares unavailable", "Live providers are unavailable");
+    }
+
+    return fallbackSuggestions;
   } catch {
+    const yahoo = await getYahooSuggestions();
+    if (yahoo) {
+      return yahoo;
+    }
+
     const alpha = await getAlphaVantageSuggestions();
-    return alpha ?? fallbackSuggestions;
+    if (alpha) {
+      return alpha;
+    }
+
+    if (config.STRICT_LIVE_MODE) {
+      throwLiveDataUnavailable("Live best shares unavailable", "Live providers are unavailable");
+    }
+
+    return fallbackSuggestions;
   }
 }

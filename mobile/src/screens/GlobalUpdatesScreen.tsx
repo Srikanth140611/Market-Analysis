@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Linking, Modal, Pressable, StyleSheet, Text, View } from "react-native";
-import { fetchForexCandles, fetchGlobalNews } from "../api/client";
+import { fetchForexCandles, fetchGlobalNews, fetchMarketTrends } from "../api/client";
 import { REFRESH_INTERVAL_MS } from "../constants";
 import { usePollingData } from "../hooks/usePollingData";
 import { theme } from "../theme";
 import { SectionCard } from "../components/SectionCard";
-import { ForexTimeframe, NewsImpact, OhlcCandle } from "../types";
+import { ForexTimeframe, MarketTrend, NewsImpact, OhlcCandle } from "../types";
 
 type TrendBias = "up" | "down" | "neutral";
 type TradeDirection = "Buy" | "Sell" | "Hold";
@@ -103,6 +103,16 @@ const PAIR_BASE_PRICE: Record<string, number> = {
   "USD/NOK": 10.73
 };
 
+const COMMODITY_BASE_PRICE: Record<string, number> = {
+  "XAU/USD": 2398.12,
+  "XAG/USD": 31.14
+};
+
+const OIL_BASE_PRICE: Record<string, number> = {
+  WTI: 78.32,
+  BRENT: 82.1
+};
+
 const REQUIRED_IMPACT_ASSETS: NewsImpact["asset"][] = ["forex", "crypto", "commodities", "oil", "shares"];
 
 function defaultImpact(asset: NewsImpact["asset"]): NewsImpact {
@@ -168,6 +178,49 @@ function focusHint(asset: NewsImpact["asset"], direction: NewsImpact["direction"
   }
 
   return "Focus on balanced risk management";
+}
+
+function unique(values: string[]) {
+  return Array.from(new Set(values));
+}
+
+function resolvePrice(symbol: string, trendBySymbol: Map<string, number>) {
+  return (
+    trendBySymbol.get(symbol) ??
+    PAIR_BASE_PRICE[symbol] ??
+    COMMODITY_BASE_PRICE[symbol] ??
+    OIL_BASE_PRICE[symbol] ??
+    0
+  );
+}
+
+function orderLevels(
+  entry: number,
+  direction: NewsImpact["direction"],
+  tpPct: number,
+  slPct: number
+): { side: "Buy" | "Sell" | "Wait"; tp: number; sl: number } {
+  if (direction === "Up") {
+    return {
+      side: "Buy",
+      tp: entry * (1 + tpPct),
+      sl: entry * (1 - slPct)
+    };
+  }
+
+  if (direction === "Down") {
+    return {
+      side: "Sell",
+      tp: entry * (1 - tpPct),
+      sl: entry * (1 + slPct)
+    };
+  }
+
+  return {
+    side: "Wait",
+    tp: entry,
+    sl: entry
+  };
 }
 
 function timeframeStepMs(timeframe: ForexTimeframe) {
@@ -958,10 +1011,18 @@ function ForexTechnicalPanel({ forexImpact }: { forexImpact: NewsImpact }) {
 export function GlobalUpdatesScreen() {
   const [openForexForNewsId, setOpenForexForNewsId] = useState<string | null>(null);
   const { data, loading, error, lastUpdated } = usePollingData(fetchGlobalNews, REFRESH_INTERVAL_MS);
+  const { data: trendsPayload } = usePollingData(fetchMarketTrends, REFRESH_INTERVAL_MS);
   const [newItemsCount, setNewItemsCount] = useState(0);
   const [lastSuccessAt, setLastSuccessAt] = useState<Date | null>(null);
   const [lastChangeAt, setLastChangeAt] = useState<Date | null>(null);
   const previousHeadlineIds = useRef<Set<string> | null>(null);
+  const trendBySymbol = useMemo(() => {
+    const map = new Map<string, number>();
+    (trendsPayload?.data ?? []).forEach((trend: MarketTrend) => {
+      map.set(trend.symbol, trend.price);
+    });
+    return map;
+  }, [trendsPayload]);
 
   useEffect(() => {
     if (!data || !lastUpdated) {
@@ -1028,6 +1089,13 @@ export function GlobalUpdatesScreen() {
               const oilImpact = impacts.find((impact) => impact.asset === "oil") ?? null;
               const sharesImpact = impacts.find((impact) => impact.asset === "shares") ?? null;
 
+              const forexPairs = unique([...(forexImpact.pairsUp ?? []), ...(forexImpact.pairsDown ?? [])]).slice(0, 6);
+              const commoditySymbols = unique([
+                ...(commoditiesImpact?.symbolsUp ?? []),
+                ...(commoditiesImpact?.symbolsDown ?? [])
+              ]).slice(0, 4);
+              const oilSymbols = unique([...(oilImpact?.symbolsUp ?? []), ...(oilImpact?.symbolsDown ?? [])]).slice(0, 4);
+
               return (
                 <>
                   <Text style={styles.title}>{item.title}</Text>
@@ -1074,6 +1142,61 @@ export function GlobalUpdatesScreen() {
                     <Text style={styles.focusText}>
                       SHARES: {(sharesImpact?.direction ?? "Neutral")} - {focusHint("shares", sharesImpact?.direction ?? "Neutral")}
                     </Text>
+                  </View>
+
+                  <View style={styles.orderBox}>
+                    <Text style={styles.orderTitle}>Suggested order plan (Entry / TP / SL)</Text>
+
+                    <Text style={styles.orderSubTitle}>Forex pairs</Text>
+                    {forexPairs.length === 0 ? <Text style={styles.orderMuted}>No forex pair setup available.</Text> : null}
+                    {forexPairs.map((pair) => {
+                      const direction: NewsImpact["direction"] = (forexImpact.pairsUp ?? []).includes(pair)
+                        ? "Up"
+                        : (forexImpact.pairsDown ?? []).includes(pair)
+                          ? "Down"
+                          : forexImpact.direction;
+                      const entry = resolvePrice(pair, trendBySymbol);
+                      const levels = orderLevels(entry, direction, 0.0075, 0.0035);
+                      return (
+                        <Text key={`${item.id}-order-forex-${pair}`} style={styles.orderText}>
+                          {pair} ({levels.side}) Entry {formatPrice(entry)} | TP {formatPrice(levels.tp)} | SL {formatPrice(levels.sl)}
+                        </Text>
+                      );
+                    })}
+
+                    <Text style={styles.orderSubTitle}>Commodities</Text>
+                    {commoditySymbols.length === 0 ? <Text style={styles.orderMuted}>No commodity setup available.</Text> : null}
+                    {commoditySymbols.map((symbol) => {
+                      const direction: NewsImpact["direction"] = (commoditiesImpact?.symbolsUp ?? []).includes(symbol)
+                        ? "Up"
+                        : (commoditiesImpact?.symbolsDown ?? []).includes(symbol)
+                          ? "Down"
+                          : (commoditiesImpact?.direction ?? "Neutral");
+                      const entry = resolvePrice(symbol, trendBySymbol);
+                      const levels = orderLevels(entry, direction, 0.012, 0.006);
+                      return (
+                        <Text key={`${item.id}-order-commodity-${symbol}`} style={styles.orderText}>
+                          {symbol} ({levels.side}) Entry {formatPrice(entry)} | TP {formatPrice(levels.tp)} | SL {formatPrice(levels.sl)}
+                        </Text>
+                      );
+                    })}
+
+                    <Text style={styles.orderSubTitle}>Oil</Text>
+                    {oilSymbols.length === 0 ? <Text style={styles.orderMuted}>No oil setup available.</Text> : null}
+                    {oilSymbols.map((symbol) => {
+                      const direction: NewsImpact["direction"] = (oilImpact?.symbolsUp ?? []).includes(symbol)
+                        ? "Up"
+                        : (oilImpact?.symbolsDown ?? []).includes(symbol)
+                          ? "Down"
+                          : (oilImpact?.direction ?? "Neutral");
+                      const entry = resolvePrice(symbol, trendBySymbol);
+                      const levels = orderLevels(entry, direction, 0.018, 0.009);
+                      return (
+                        <Text key={`${item.id}-order-oil-${symbol}`} style={styles.orderText}>
+                          {symbol} ({levels.side}) Entry {formatPrice(entry)} | TP {formatPrice(levels.tp)} | SL {formatPrice(levels.sl)}
+                        </Text>
+                      );
+                    })}
                   </View>
 
                   <View key={`${item.id}-forex-breakdown`} style={styles.fxBox}>
@@ -1217,6 +1340,36 @@ const styles = StyleSheet.create({
   },
   focusText: {
     color: "#b7d8e9",
+    fontSize: 11,
+    marginTop: 2
+  },
+  orderBox: {
+    marginTop: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#2c637a",
+    backgroundColor: "#103143",
+    padding: 8
+  },
+  orderTitle: {
+    color: "#e0f3ff",
+    fontSize: 11,
+    fontWeight: "800",
+    marginBottom: 4
+  },
+  orderSubTitle: {
+    color: "#bfe1f2",
+    fontSize: 11,
+    fontWeight: "700",
+    marginTop: 4
+  },
+  orderText: {
+    color: "#d6eaf7",
+    fontSize: 11,
+    marginTop: 2
+  },
+  orderMuted: {
+    color: theme.colors.muted,
     fontSize: 11,
     marginTop: 2
   },

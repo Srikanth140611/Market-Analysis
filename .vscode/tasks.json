@@ -1,0 +1,77 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "aws-status-check",
+			"type": "shell",
+			"command": "\"C:\\Program Files\\Amazon\\AWSCLIV2\\aws.exe\" cloudfront get-distribution --id E28OOTJ7FE6YAQ --query \"Distribution.{Status:Status,Aliases:DistributionConfig.Aliases.Items,DomainName:DomainName}\"",
+			"isBackground": false
+		},
+		{
+			"label": "aws-status-check-2",
+			"type": "shell",
+			"command": "& \"C:\\Program Files\\Amazon\\AWSCLIV2\\aws.exe\" cloudfront get-distribution --id E28OOTJ7FE6YAQ --output json",
+			"isBackground": false
+		},
+		{
+			"label": "aws-status-check-3",
+			"type": "shell",
+			"command": "aws cloudfront get-distribution --id E28OOTJ7FE6YAQ --output json",
+			"isBackground": false
+		},
+		{
+			"label": "aws-status-check-4",
+			"type": "shell",
+			"command": "C:\\Progra~1\\Amazon\\AWSCLIV2\\aws.exe cloudfront get-distribution --id E28OOTJ7FE6YAQ --query Distribution.Status --output text",
+			"isBackground": false
+		},
+		{
+			"label": "aws-step2-inspect",
+			"type": "shell",
+			"command": "$aws='C:\\Progra~1\\Amazon\\AWSCLIV2\\aws.exe'; $root='dfmarketanalysis.com'; $full='app.dfmarketanalysis.com'; & $aws route53 list-hosted-zones-by-name --dns-name $root --query \"HostedZones[?Name=='$root.'].{Id:Id,Name:Name}\" --output json; & $aws acm list-certificates --region us-east-1 --query \"CertificateSummaryList[?DomainName=='$full'].{Arn:CertificateArn,Domain:DomainName}\" --output json",
+			"isBackground": false
+		},
+		{
+			"label": "aws-step2-inspect2",
+			"type": "shell",
+			"command": "$aws='C:\\Progra~1\\Amazon\\AWSCLIV2\\aws.exe'; $root='dfmarketanalysis.com'; $full='app.dfmarketanalysis.com'; & $aws route53 list-hosted-zones-by-name --dns-name $root --output json; & $aws acm list-certificates --region us-east-1 --output json",
+			"isBackground": false
+		},
+		{
+			"label": "aws-step2-inspect3",
+			"type": "shell",
+			"command": "$env:AWS_PAGER=''; $aws='C:\\Progra~1\\Amazon\\AWSCLIV2\\aws.exe'; $root='dfmarketanalysis.com'; & $aws route53 list-hosted-zones-by-name --dns-name $root --output json --no-cli-pager; & $aws acm list-certificates --region us-east-1 --output json --no-cli-pager",
+			"isBackground": false
+		},
+		{
+			"label": "aws-step2-validate-record",
+			"type": "shell",
+			"command": "$env:AWS_PAGER=''; $aws='C:\\Progra~1\\Amazon\\AWSCLIV2\\aws.exe'; $cert='arn:aws:acm:us-east-1:729297431161:certificate/638b27df-0a75-4eeb-9dde-686606b47fa7'; $zone='Z07854089RH5Y6GKFWIX'; $desc = & $aws acm describe-certificate --region us-east-1 --certificate-arn $cert --output json --no-cli-pager | ConvertFrom-Json; $rr = $desc.Certificate.DomainValidationOptions[0].ResourceRecord; if (-not $rr) { throw 'No validation ResourceRecord yet'; }; $file = Join-Path $env:TEMP 'acm-validation-upsert.json'; @\"{`n  \"\"Comment\"\": \"\"ACM validation\"\",`n  \"\"Changes\"\": [`n    {`n      \"\"Action\"\": \"\"UPSERT\"\",`n      \"\"ResourceRecordSet\"\": {`n        \"\"Name\"\": \"\"$($rr.Name)\"\",`n        \"\"Type\"\": \"\"$($rr.Type)\"\",`n        \"\"TTL\"\": 300,`n        \"\"ResourceRecords\"\": [{ \"\"Value\"\": \"\"$($rr.Value)\"\" }]`n      }`n    }`n  ]`n}\"@ | Set-Content $file -NoNewline; & $aws route53 change-resource-record-sets --hosted-zone-id $zone --change-batch file://$file --no-cli-pager; & $aws acm describe-certificate --region us-east-1 --certificate-arn $cert --query \"Certificate.DomainValidationOptions[0].ValidationStatus\" --output text --no-cli-pager",
+			"isBackground": false
+		},
+		{
+			"label": "aws-cert-status",
+			"type": "shell",
+			"command": "C:\\Progra~1\\Amazon\\AWSCLIV2\\aws.exe acm describe-certificate --region us-east-1 --certificate-arn arn:aws:acm:us-east-1:729297431161:certificate/638b27df-0a75-4eeb-9dde-686606b47fa7 --query Certificate.DomainValidationOptions[0].ValidationStatus --output text --no-cli-pager",
+			"isBackground": false
+		},
+		{
+			"label": "cf-auth-status",
+			"type": "shell",
+			"command": "$env:AWS_PAGER=''; C:\\Progra~1\\Amazon\\AWSCLIV2\\aws.exe cloudfront get-distribution --id E28OOTJ7FE6YAQ --query 'Distribution.{Status:Status,FunctionAssociations:DistributionConfig.DefaultCacheBehavior.FunctionAssociations}' --output json --no-cli-pager",
+			"isBackground": false
+		},
+		{
+			"label": "cf-auth-status-raw",
+			"type": "shell",
+			"command": "$env:AWS_PAGER=''; C:\\Progra~1\\Amazon\\AWSCLIV2\\aws.exe cloudfront get-distribution --id E28OOTJ7FE6YAQ --output json --no-cli-pager",
+			"isBackground": false
+		},
+		{
+			"label": "cf-auth-verify-config",
+			"type": "shell",
+			"command": "$env:AWS_PAGER=''; C:\\Progra~1\\Amazon\\AWSCLIV2\\aws.exe cloudfront get-distribution --id E28OOTJ7FE6YAQ --output json --no-cli-pager",
+			"isBackground": false
+		}
+	]
+}
