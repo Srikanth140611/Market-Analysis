@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import { fetchMarketAgents } from "../api/client";
 import { REFRESH_INTERVAL_MS } from "../constants";
 import { usePollingData } from "../hooks/usePollingData";
@@ -17,6 +17,12 @@ const TIMEFRAME_ORDER: Record<string, number> = {
   "1Day": 7,
   "1Week": 8
 };
+
+const AGENT_MENU = [
+  { key: "forex", label: "Forex Signal Analysis", match: "Forex" },
+  { key: "commodities", label: "Commodities Analysis", match: "Commodities" },
+  { key: "oil", label: "Oil Analysis", match: "Oil" }
+] as const;
 
 function sourceColor(source: string) {
   if (source === "live") {
@@ -308,8 +314,15 @@ function AgentCard({
 
 export function AgentsScreen() {
   const { data, loading, error } = usePollingData(fetchMarketAgents, REFRESH_INTERVAL_MS);
+  const { width } = useWindowDimensions();
   const [expandedSymbols, setExpandedSymbols] = useState<Record<string, boolean>>({});
   const [selectedAnalysisKey, setSelectedAnalysisKey] = useState<string | null>(null);
+  const [selectedAgentKey, setSelectedAgentKey] = useState<string>(AGENT_MENU[0].key);
+
+  const agents = data?.data ?? [];
+  const selectedMenu = AGENT_MENU.find((item) => item.key === selectedAgentKey) ?? AGENT_MENU[0];
+  const selectedAgent = agents.find((agent) => agent.agent === selectedMenu.match) ?? agents[0] ?? null;
+  const isCompactLayout = width < 900;
 
   const toggleSymbol = (key: string) => {
     setExpandedSymbols((previous) => ({
@@ -331,16 +344,48 @@ export function AgentsScreen() {
           <Text style={[styles.source, { color: sourceColor(data.source) }]}>Source: {data.source}{data.reason ? ` (${data.reason})` : ""}</Text>
         ) : null}
 
-        {(data?.data ?? []).map((agent) => (
-          <AgentCard
-            key={agent.agent}
-            agent={agent}
-            expandedSymbols={expandedSymbols}
-            onToggleSymbol={toggleSymbol}
-            selectedAnalysisKey={selectedAnalysisKey}
-            onToggleAnalysis={toggleAnalysis}
-          />
-        ))}
+        {agents.length > 0 ? (
+          <View style={[styles.agentLayout, isCompactLayout ? styles.agentLayoutCompact : null]}>
+            <View style={[styles.agentMenuPanel, isCompactLayout ? styles.agentMenuPanelCompact : null]}>
+              {AGENT_MENU.map((item) => {
+                const isActive = item.key === selectedMenu.key;
+                const isAvailable = agents.some((agent) => agent.agent === item.match);
+
+                return (
+                  <Pressable
+                    key={item.key}
+                    style={[
+                      styles.agentMenuButton,
+                      isActive ? styles.agentMenuButtonActive : null,
+                      !isAvailable ? styles.agentMenuButtonDisabled : null
+                    ]}
+                    onPress={() => setSelectedAgentKey(item.key)}
+                    disabled={!isAvailable}
+                  >
+                    <Text style={[styles.agentMenuButtonText, isActive ? styles.agentMenuButtonTextActive : null]}>
+                      {item.label}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+
+            <View style={styles.agentContentPanel}>
+              {selectedAgent ? (
+                <AgentCard
+                  key={selectedAgent.agent}
+                  agent={selectedAgent}
+                  expandedSymbols={expandedSymbols}
+                  onToggleSymbol={toggleSymbol}
+                  selectedAnalysisKey={selectedAnalysisKey}
+                  onToggleAnalysis={toggleAnalysis}
+                />
+              ) : (
+                <Text style={styles.muted}>No agent data available.</Text>
+              )}
+            </View>
+          </View>
+        ) : null}
       </SectionCard>
     </View>
   );
@@ -359,6 +404,52 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     fontSize: 12,
     fontWeight: "700"
+  },
+  agentLayout: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 12
+  },
+  agentLayoutCompact: {
+    flexDirection: "column"
+  },
+  agentMenuPanel: {
+    width: 230,
+    backgroundColor: "#0b1d29",
+    borderWidth: 1,
+    borderColor: "#1f4358",
+    borderRadius: 12,
+    padding: 10,
+    gap: 8
+  },
+  agentMenuPanelCompact: {
+    width: "100%"
+  },
+  agentMenuButton: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#24566f",
+    backgroundColor: "#102b3b",
+    paddingHorizontal: 10,
+    paddingVertical: 10
+  },
+  agentMenuButtonActive: {
+    backgroundColor: theme.colors.accent,
+    borderColor: theme.colors.accent
+  },
+  agentMenuButtonDisabled: {
+    opacity: 0.45
+  },
+  agentMenuButtonText: {
+    color: theme.colors.text,
+    fontSize: 12,
+    fontWeight: "700"
+  },
+  agentMenuButtonTextActive: {
+    color: "#03222f"
+  },
+  agentContentPanel: {
+    flex: 1
   },
   agentCard: {
     borderWidth: 1,
