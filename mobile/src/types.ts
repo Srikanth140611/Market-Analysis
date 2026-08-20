@@ -193,6 +193,9 @@ export type MarketAgentTimeframeSignal = {
   timeframe: MarketHistoryTimeframe;
   pattern: MarketPatternKind;
   confidence: number;
+  calibratedConfidence?: number;
+  calibrationSampleSize?: number;
+  calibrationBucket?: string;
   direction: "up" | "down" | "neutral";
   currentPrice: number;
   lastOccurrenceAt: string;
