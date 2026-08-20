@@ -294,7 +294,11 @@ function AgentCard({
             return (
               <View key={symbol.symbol} style={styles.forexRowWrap}>
                 <View style={styles.forexTableRow}>
-                  <Text style={[styles.forexCell, styles.cellPair]}>{symbol.symbol}</Text>
+                  <Text style={[styles.forexCell, styles.cellPair]}>
+                    {symbol.symbol}
+                    {"\n"}
+                    <Text style={styles.inlineLiveTime}>AEST {formatAestTimestamp(mt4Quote?.timestamp)}</Text>
+                  </Text>
                   <Text style={[styles.forexCell, styles.cellPrice]}>{formatForexQuote(symbol.symbol, liveBuy)}</Text>
                   <Text style={[styles.forexCell, styles.cellPrice]}>{formatForexQuote(symbol.symbol, liveSell)}</Text>
                   <Text
@@ -749,6 +753,11 @@ const styles = StyleSheet.create({
   cellSignal: {
     flex: 0.9,
     fontWeight: "700"
+  },
+  inlineLiveTime: {
+    color: theme.colors.muted,
+    fontSize: 10,
+    fontWeight: "500"
   },
   forexTableHint: {
     color: theme.colors.muted,
