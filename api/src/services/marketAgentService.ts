@@ -135,6 +135,9 @@ export type ForexTradeMonitoringReport = {
   activeTrades: number;
   resolvedTrades: number;
   winRatePercent: number;
+  monitoringDayKey: string;
+  monitoringTimeZone: string;
+  confidenceThreshold: number;
   generatedAt: string;
   items: ForexTradeMonitoringItem[];
 };
@@ -209,6 +212,9 @@ const AGENT_CONFIG: Array<{
 ];
 
 const ANALYSIS_TIMEFRAMES: MarketAgentAnalysisTimeframe[] = ["1hour", "4hour", "12hour", "1Day", "1Week"];
+const MONITORING_TIME_ZONE = "Australia/Sydney";
+const MONITORING_CONFIDENCE_THRESHOLD = 80;
+const MONITORING_START_DAY_KEY = currentSydneyDayKey();
 
 const TIMEFRAME_WEIGHTS: Record<MarketAgentAnalysisTimeframe, number> = {
   "1hour": 5,
@@ -224,6 +230,34 @@ const forexTradeLedger = new Map<string, ForexTradeMonitoringItem>();
 
 function formatTimestamp(timestamp: number) {
   return new Date(timestamp).toISOString();
+}
+
+function currentSydneyDayKey(timestamp: string | number | Date = new Date()) {
+  const value = timestamp instanceof Date ? timestamp : new Date(timestamp);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: MONITORING_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(value);
+
+  const year = parts.find((part) => part.type === "year")?.value ?? "0000";
+  const month = parts.find((part) => part.type === "month")?.value ?? "00";
+  const day = parts.find((part) => part.type === "day")?.value ?? "00";
+  return `${year}-${month}-${day}`;
+}
+
+function buildSydneyDayRange(startDayKey: string, endDayKey: string) {
+  const days: string[] = [];
+  const cursor = new Date(`${startDayKey}T00:00:00.000Z`);
+  const endCursor = new Date(`${endDayKey}T00:00:00.000Z`);
+
+  while (cursor.getTime() <= endCursor.getTime()) {
+    days.push(currentSydneyDayKey(cursor));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+
+  return days;
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -244,7 +278,7 @@ function buildSimulatedTradeId(symbol: string, signal: MarketAgentTimeframeSigna
     symbol,
     signal.timeframe,
     signal.direction,
-    toUtcDayKey(signal.lastOccurrenceAt)
+    currentSydneyDayKey()
   ].join(":");
 }
 
@@ -968,11 +1002,23 @@ function trimTradeLedger(maxEntries = 1200) {
   }
 }
 
+function purgeMonitoringLedgerBeforeDay(dayKey: string) {
+  for (const [tradeId, trade] of forexTradeLedger.entries()) {
+    if (currentSydneyDayKey(trade.openedAt) < dayKey) {
+      forexTradeLedger.delete(tradeId);
+    }
+  }
+}
+
 function upsertSimulatedTradesFromForexAgent(forex: MarketAgentReport, generatedAt: string) {
   normalizeTradeLedger();
 
   for (const symbolReport of forex.symbols) {
     for (const signal of symbolReport.timeframeSignals) {
+      if (signal.confidence < MONITORING_CONFIDENCE_THRESHOLD) {
+        continue;
+      }
+
       if (signal.direction === "neutral") {
         continue;
       }
@@ -981,7 +1027,6 @@ function upsertSimulatedTradesFromForexAgent(forex: MarketAgentReport, generated
       const existing = forexTradeLedger.get(tradeId);
 
       if (!existing) {
-        const openedAt = Number.isFinite(Date.parse(signal.lastOccurrenceAt)) ? signal.lastOccurrenceAt : generatedAt;
         forexTradeLedger.set(tradeId, {
           tradeId,
           symbol: symbolReport.symbol,
@@ -994,7 +1039,7 @@ function upsertSimulatedTradesFromForexAgent(forex: MarketAgentReport, generated
           currentPrice: symbolReport.currentPrice,
           riskRewardRatio: signal.tradePlan.riskRewardRatio,
           status: "open",
-          openedAt
+          openedAt: generatedAt
         });
       }
     }
@@ -1045,6 +1090,7 @@ export async function getForexTradeMonitoringReport(): Promise<ForexTradeMonitor
   const agents = await getMarketAgentsAnalysis();
   const forex = agents.data.find((agent) => agent.agent === "Forex");
   const generatedAt = new Date().toISOString();
+  const monitoringDayKey = currentSydneyDayKey(generatedAt);
 
   if (!forex) {
     return {
@@ -1056,17 +1102,21 @@ export async function getForexTradeMonitoringReport(): Promise<ForexTradeMonitor
       activeTrades: 0,
       resolvedTrades: 0,
       winRatePercent: 0,
+      monitoringDayKey,
+      monitoringTimeZone: MONITORING_TIME_ZONE,
+      confidenceThreshold: MONITORING_CONFIDENCE_THRESHOLD,
       generatedAt,
       items: []
     };
   }
 
+  purgeMonitoringLedgerBeforeDay(MONITORING_START_DAY_KEY);
   upsertSimulatedTradesFromForexAgent(forex, generatedAt);
   updateOpenTradesWithCurrentPrices(forex, generatedAt);
 
   const items = Array.from(forexTradeLedger.values()).sort((left, right) => {
     return new Date(right.openedAt).getTime() - new Date(left.openedAt).getTime();
-  });
+  }).filter((item) => currentSydneyDayKey(item.openedAt) >= MONITORING_START_DAY_KEY);
 
   const tpHitCount = items.filter((item) => item.status === "tp-hit").length;
   const slHitCount = items.filter((item) => item.status === "sl-hit").length;
@@ -1084,6 +1134,9 @@ export async function getForexTradeMonitoringReport(): Promise<ForexTradeMonitor
     activeTrades: openCount,
     resolvedTrades,
     winRatePercent,
+    monitoringDayKey,
+    monitoringTimeZone: MONITORING_TIME_ZONE,
+    confidenceThreshold: MONITORING_CONFIDENCE_THRESHOLD,
     generatedAt,
     items
   };
@@ -1108,12 +1161,13 @@ export async function getForexTradeMonitoringHistoryReport(days = 10): Promise<F
   // Refresh/open simulated trades before building rolling history.
   await getForexTradeMonitoringReport();
 
-  const dayKeys = buildHistoryDateRange(daysRequested);
+  const monitoringEndDayKey = currentSydneyDayKey();
+  const dayKeys = buildSydneyDayRange(MONITORING_START_DAY_KEY, monitoringEndDayKey).slice(-daysRequested);
   const daily = dayKeys.map((dayKey): ForexTradeMonitoringDailySnapshot => {
-    const openedTrades = Array.from(forexTradeLedger.values()).filter((item) => toUtcDayKey(item.openedAt) === dayKey).length;
-    const tpHitCount = Array.from(forexTradeLedger.values()).filter((item) => item.status === "tp-hit" && item.closedAt && toUtcDayKey(item.closedAt) === dayKey).length;
-    const slHitCount = Array.from(forexTradeLedger.values()).filter((item) => item.status === "sl-hit" && item.closedAt && toUtcDayKey(item.closedAt) === dayKey).length;
-    const openCount = Array.from(forexTradeLedger.values()).filter((item) => item.status === "open" && toUtcDayKey(item.openedAt) === dayKey).length;
+    const openedTrades = Array.from(forexTradeLedger.values()).filter((item) => currentSydneyDayKey(item.openedAt) === dayKey).length;
+    const tpHitCount = Array.from(forexTradeLedger.values()).filter((item) => item.status === "tp-hit" && item.closedAt && currentSydneyDayKey(item.closedAt) === dayKey).length;
+    const slHitCount = Array.from(forexTradeLedger.values()).filter((item) => item.status === "sl-hit" && item.closedAt && currentSydneyDayKey(item.closedAt) === dayKey).length;
+    const openCount = Array.from(forexTradeLedger.values()).filter((item) => item.status === "open" && currentSydneyDayKey(item.openedAt) === dayKey).length;
     const resolvedTrades = tpHitCount + slHitCount;
     const hasData = openedTrades > 0 || resolvedTrades > 0;
 

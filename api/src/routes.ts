@@ -169,6 +169,7 @@ function renderMonitoringReportHtml(report: ForexTradeMonitoringReport) {
   <div class="wrap">
     <h1>Forex Trade Monitoring Report</h1>
     <div class="meta">Generated at ${escapeHtml(report.generatedAt)}</div>
+    <div class="meta">Monitoring day ${escapeHtml(report.monitoringDayKey)} | Time zone ${escapeHtml(report.monitoringTimeZone)} | Confidence threshold &ge; ${report.confidenceThreshold}%</div>
     <section class="stats">
       <div class="stat"><span class="k">Total Trades</span><span class="v">${report.totalTrades}</span></div>
       <div class="stat"><span class="k">TP Hit</span><span class="v">${report.tpHitCount}</span></div>
