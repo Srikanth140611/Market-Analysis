@@ -55,6 +55,9 @@ export type MarketAgentTimeframeSignal = {
   timeframe: MarketAgentAnalysisTimeframe;
   pattern: MarketPatternKind;
   confidence: number;
+  calibratedConfidence?: number;
+  calibrationSampleSize?: number;
+  calibrationBucket?: string;
   direction: "up" | "down" | "neutral";
   currentPrice: number;
   lastOccurrenceAt: string;
@@ -110,6 +113,7 @@ export type ForexTradeMonitoringItem = {
   tradeId: string;
   symbol: string;
   timeframe: MarketAgentAnalysisTimeframe;
+  confidence?: number;
   direction: "up" | "down" | "neutral";
   entry: number;
   stopLoss: number;
@@ -214,6 +218,8 @@ const TIMEFRAME_WEIGHTS: Record<MarketAgentAnalysisTimeframe, number> = {
   "1Week": 1
 };
 
+const CONFIDENCE_CALIBRATION_PRIOR_WEIGHT = 25;
+
 const forexTradeLedger = new Map<string, ForexTradeMonitoringItem>();
 
 function formatTimestamp(timestamp: number) {
@@ -240,6 +246,85 @@ function buildSimulatedTradeId(symbol: string, signal: MarketAgentTimeframeSigna
     signal.direction,
     toUtcDayKey(signal.lastOccurrenceAt)
   ].join(":");
+}
+
+function confidenceBucket(confidence: number) {
+  if (confidence <= 64) {
+    return "55-64";
+  }
+
+  if (confidence <= 74) {
+    return "65-74";
+  }
+
+  if (confidence <= 84) {
+    return "75-84";
+  }
+
+  return "85+";
+}
+
+type ConfidenceCalibrationStats = {
+  wins: number;
+  total: number;
+};
+
+type CalibrationStatsByTimeframe = Record<MarketAgentAnalysisTimeframe, Record<string, ConfidenceCalibrationStats>>;
+
+function emptyCalibrationStatsByTimeframe(): CalibrationStatsByTimeframe {
+  return {
+    "1hour": {},
+    "4hour": {},
+    "12hour": {},
+    "1Day": {},
+    "1Week": {}
+  };
+}
+
+function buildCalibrationStatsByTimeframe(): CalibrationStatsByTimeframe {
+  const stats = emptyCalibrationStatsByTimeframe();
+
+  for (const trade of forexTradeLedger.values()) {
+    if (trade.status !== "tp-hit" && trade.status !== "sl-hit") {
+      continue;
+    }
+
+    if (typeof trade.confidence !== "number" || !Number.isFinite(trade.confidence)) {
+      continue;
+    }
+
+    const timeframeStats = stats[trade.timeframe];
+    const bucket = confidenceBucket(trade.confidence);
+    const existing = timeframeStats[bucket] ?? { wins: 0, total: 0 };
+    existing.total += 1;
+    if (trade.status === "tp-hit") {
+      existing.wins += 1;
+    }
+
+    timeframeStats[bucket] = existing;
+  }
+
+  return stats;
+}
+
+function calibrateConfidence(
+  rawConfidence: number,
+  timeframe: MarketAgentAnalysisTimeframe,
+  calibrationStatsByTimeframe: CalibrationStatsByTimeframe
+) {
+  const bucket = confidenceBucket(rawConfidence);
+  const bucketStats = calibrationStatsByTimeframe[timeframe][bucket];
+  const total = bucketStats?.total ?? 0;
+  const wins = bucketStats?.wins ?? 0;
+
+  // Bayesian smoothing: blend empirical win-rate with raw-confidence prior.
+  const prior = clamp(rawConfidence / 100, 0.01, 0.99);
+  const posterior = (wins + CONFIDENCE_CALIBRATION_PRIOR_WEIGHT * prior) / (total + CONFIDENCE_CALIBRATION_PRIOR_WEIGHT);
+  return {
+    calibratedConfidence: Math.round(clamp(posterior * 100, 1, 99)),
+    calibrationSampleSize: total,
+    calibrationBucket: bucket
+  };
 }
 
 function normalizeTradeLedger() {
@@ -677,12 +762,16 @@ function buildSignal(
   pattern: MarketPatternSignal,
   candles: { t: number; o: number; h: number; l: number; c: number }[],
   source: HistorySource,
-  liveSpotPrice?: number | null
+  liveSpotPrice?: number | null,
+  calibrationStatsByTimeframe?: CalibrationStatsByTimeframe
 ): MarketAgentTimeframeSignal {
   const latestCandle = candles[candles.length - 1] ?? null;
   const currentPrice = liveSpotPrice ?? latestCandle?.c ?? pattern.latestClose;
   const lastOccurrenceAt = latestCandle ? formatTimestamp(latestCandle.t > 1e12 ? latestCandle.t : latestCandle.t * 1000) : new Date().toISOString();
   const confidence = Math.round(pattern.confidence);
+  const calibration = calibrationStatsByTimeframe
+    ? calibrateConfidence(confidence, timeframe, calibrationStatsByTimeframe)
+    : undefined;
   const strategiesApplied = strategiesForPattern(pattern.pattern, pattern.direction, category, symbol);
   const tradePlan = buildTradePlan(currentPrice, pattern.support, pattern.resistance, pattern.direction, pattern.pattern, confidence, timeframe, category);
   const technicals = buildTechnicalAnalysis(symbol, timeframe, candles, pattern.support, pattern.resistance);
@@ -693,6 +782,9 @@ function buildSignal(
     timeframe,
     pattern: pattern.pattern,
     confidence,
+    calibratedConfidence: calibration?.calibratedConfidence,
+    calibrationSampleSize: calibration?.calibrationSampleSize,
+    calibrationBucket: calibration?.calibrationBucket,
     direction: pattern.direction,
     currentPrice: roundTo(currentPrice),
     lastOccurrenceAt,
@@ -734,6 +826,7 @@ export async function getMarketAgentsAnalysis(): Promise<MarketAgentsResponse> {
   const reports: MarketAgentReport[] = [];
   const sources = new Set<HistorySource>();
   const generatedAt = new Date().toISOString();
+  const calibrationStatsByTimeframe = buildCalibrationStatsByTimeframe();
 
   for (const config of AGENT_CONFIG) {
     const history = await getMarketHistory(config.symbols, ANALYSIS_TIMEFRAMES, 5);
@@ -752,7 +845,7 @@ export async function getMarketAgentsAnalysis(): Promise<MarketAgentsResponse> {
           }
 
           sources.add(frame.source);
-          return buildSignal(symbol, config.category, timeframe, pattern, frame.candles, frame.source, liveSpotPrice);
+          return buildSignal(symbol, config.category, timeframe, pattern, frame.candles, frame.source, liveSpotPrice, calibrationStatsByTimeframe);
         })
         .filter((signal): signal is MarketAgentTimeframeSignal => Boolean(signal));
 
@@ -893,6 +986,7 @@ function upsertSimulatedTradesFromForexAgent(forex: MarketAgentReport, generated
           tradeId,
           symbol: symbolReport.symbol,
           timeframe: signal.timeframe,
+          confidence: signal.confidence,
           direction: signal.direction,
           entry: signal.tradePlan.entry,
           stopLoss: signal.tradePlan.stopLoss,
