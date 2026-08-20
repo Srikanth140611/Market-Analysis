@@ -1,12 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getApiNotice } from "../api/client";
 
-export function usePollingData<T>(fetcher: () => Promise<T>, intervalMs: number) {
-  const [data, setData] = useState<T | null>(null);
-  const [loading, setLoading] = useState(true);
+type PollingCacheEntry = {
+  data: unknown;
+  updatedAt: number;
+};
+
+const pollingCache = new Map<string, PollingCacheEntry>();
+
+export function usePollingData<T>(fetcher: () => Promise<T>, intervalMs: number, cacheKey?: string) {
+  const cached = cacheKey ? pollingCache.get(cacheKey) : undefined;
+  const [data, setData] = useState<T | null>(() => (cached ? (cached.data as T) : null));
+  const [loading, setLoading] = useState(() => !cached);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [notice, setNotice] = useState<string | null>(() =>
+    cached ? "Showing cached data while live refresh reconnects." : null
+  );
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(() =>
+    cached ? new Date(cached.updatedAt) : null
+  );
   const inFlight = useRef(false);
   const fetcherRef = useRef(fetcher);
   const failureCountRef = useRef(0);
@@ -25,6 +37,9 @@ export function usePollingData<T>(fetcher: () => Promise<T>, intervalMs: number)
     try {
       const result = await fetcherRef.current();
       setData(result);
+      if (cacheKey) {
+        pollingCache.set(cacheKey, { data: result, updatedAt: Date.now() });
+      }
       setError(null);
       setNotice(getApiNotice());
       setLastUpdated(new Date());
@@ -48,7 +63,7 @@ export function usePollingData<T>(fetcher: () => Promise<T>, intervalMs: number)
       setLoading(false);
       inFlight.current = false;
     }
-  }, [data]);
+  }, [cacheKey, data]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -90,7 +105,9 @@ export function usePollingData<T>(fetcher: () => Promise<T>, intervalMs: number)
       void load();
     };
 
-    void load();
+    if (!data) {
+      void load();
+    }
     schedule();
 
     if (typeof document !== "undefined") {
@@ -115,7 +132,7 @@ export function usePollingData<T>(fetcher: () => Promise<T>, intervalMs: number)
         window.removeEventListener("focus", refreshWhenVisible);
       }
     };
-  }, [intervalMs, load]);
+  }, [data, intervalMs, load]);
 
   return {
     data,

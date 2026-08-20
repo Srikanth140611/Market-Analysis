@@ -21,13 +21,14 @@ function suggestionColor(direction: "up" | "down", confidence: number) {
 }
 
 export function TrendsScreen() {
-  const { data, loading, error } = usePollingData(fetchMarketTrends, REFRESH_INTERVAL_MS);
+  const { data, loading, error, notice } = usePollingData(fetchMarketTrends, REFRESH_INTERVAL_MS, "market-trends");
 
   return (
     <View>
       <SectionCard title="Forex, Commodities and Oil Trends" subtitle="Live momentum and confidence signals">
         {loading ? <Text style={styles.muted}>Loading trend data...</Text> : null}
-        {error ? <Text style={styles.error}>{error}</Text> : null}
+        {notice ? <Text style={styles.notice}>{notice}</Text> : null}
+        {error && !data ? <Text style={styles.error}>{error}</Text> : null}
         {data ? (
           <Text style={[styles.source, data.source === "live" ? styles.sourceLive : styles.sourceFallback]}>
             Data Source: {data.source === "live" ? "Live" : "Fallback"}
@@ -109,6 +110,10 @@ const styles = StyleSheet.create({
   },
   error: {
     color: theme.colors.negative,
+    marginBottom: 8
+  },
+  notice: {
+    color: theme.colors.warning,
     marginBottom: 8
   },
   source: {

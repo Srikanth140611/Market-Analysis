@@ -54,13 +54,14 @@ function FactorBar({ label, value, color }: { label: string; value: number; colo
 }
 
 export function BestSharesScreen() {
-  const { data, loading, error } = usePollingData(fetchBestShares, REFRESH_INTERVAL_MS);
+  const { data, loading, error, notice } = usePollingData(fetchBestShares, REFRESH_INTERVAL_MS, "best-shares");
 
   return (
     <View>
       <SectionCard title="Top Trending Shares" subtitle="Suggestions based on momentum and participation">
         {loading ? <Text style={styles.muted}>Loading share ideas...</Text> : null}
-        {error ? <Text style={styles.error}>{error}</Text> : null}
+        {notice ? <Text style={styles.notice}>{notice}</Text> : null}
+        {error && !(data && data.length > 0) ? <Text style={styles.error}>{error}</Text> : null}
 
         {(data ?? []).map((item) => (
           <View key={item.symbol} style={styles.row}>
@@ -254,6 +255,10 @@ const styles = StyleSheet.create({
   },
   error: {
     color: theme.colors.negative,
+    marginBottom: 8
+  },
+  notice: {
+    color: theme.colors.warning,
     marginBottom: 8
   }
 });
