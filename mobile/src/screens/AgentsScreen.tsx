@@ -193,15 +193,51 @@ function confidenceNarrative(signal: MarketAgentTimeframeSignal) {
   return pieces.join(" | ");
 }
 
+function confidenceGapMeta(signal: MarketAgentTimeframeSignal) {
+  if (typeof signal.calibratedConfidence !== "number") {
+    return {
+      text: `${signal.confidence}%/-`,
+      toneLabel: "NO CAL",
+      color: theme.colors.muted
+    };
+  }
+
+  const gap = Math.abs(signal.confidence - signal.calibratedConfidence);
+  if (gap <= 6) {
+    return {
+      text: `${signal.confidence}%/${signal.calibratedConfidence}%`,
+      toneLabel: "ALIGNED",
+      color: theme.colors.positive
+    };
+  }
+
+  if (gap <= 14) {
+    return {
+      text: `${signal.confidence}%/${signal.calibratedConfidence}%`,
+      toneLabel: "WATCH",
+      color: theme.colors.warning
+    };
+  }
+
+  return {
+    text: `${signal.confidence}%/${signal.calibratedConfidence}%`,
+    toneLabel: "WIDE GAP",
+    color: theme.colors.negative
+  };
+}
+
 function AgentSignalCard({ signal }: { signal: MarketAgentTimeframeSignal }) {
+  const confidenceMeta = confidenceGapMeta(signal);
+
   return (
     <View style={styles.signalCard}>
       <View style={styles.signalTopRow}>
         <Text style={styles.signalTimeframe}>{signal.timeframe}</Text>
         <Text style={[styles.signalDirection, { color: directionColor(signal.direction) }]}>
-          {signal.pattern.toUpperCase()} | {signal.direction.toUpperCase()} | Raw {signal.confidence}%{typeof signal.calibratedConfidence === "number" ? ` | Cal ${signal.calibratedConfidence}%` : ""}
+          {signal.pattern.toUpperCase()} | {signal.direction.toUpperCase()} | {confidenceMeta.text}
         </Text>
       </View>
+      <Text style={[styles.signalMeta, { color: confidenceMeta.color }]}>Confidence gap: {confidenceMeta.toneLabel}</Text>
       <Text style={styles.signalMeta}>Occurred {formatTimestamp(signal.lastOccurrenceAt)}</Text>
       <Text style={styles.signalMeta}>Price {formatPrice(signal.currentPrice)} | Source {signal.source}</Text>
       <Text style={styles.signalNote}>{signal.strategySummary}</Text>
@@ -249,6 +285,7 @@ function AgentCard({
   mt4QuotesFresh: boolean;
 }) {
   const isForexAgent = agent.agent === "Forex";
+  const bestSignalConfidenceMeta = confidenceGapMeta(agent.bestSignal);
 
   return (
     <View style={styles.agentCard}>
@@ -263,7 +300,10 @@ function AgentCard({
       </View>
 
       <Text style={[styles.bestSignal, { color: directionColor(agent.bestSignal.direction) }]}>
-        Best: {agent.bestSignal.pattern.toUpperCase()} on {agent.bestSignal.timeframe} | Raw {agent.bestSignal.confidence}%{typeof agent.bestSignal.calibratedConfidence === "number" ? ` | Cal ${agent.bestSignal.calibratedConfidence}%` : ""}
+        Best: {agent.bestSignal.pattern.toUpperCase()} on {agent.bestSignal.timeframe} | {bestSignalConfidenceMeta.text}
+      </Text>
+      <Text style={[styles.description, { color: bestSignalConfidenceMeta.color, marginTop: 2 }]}>
+        Confidence gap: {bestSignalConfidenceMeta.toneLabel}
       </Text>
       <Text style={styles.description}>{agent.summary}</Text>
       <Text style={styles.description}>{agent.strategySummary}</Text>
@@ -316,6 +356,7 @@ function AgentCard({
 
           {agent.symbols.map((symbol) => {
             const signal = symbol.bestSignal;
+            const confidenceMeta = confidenceGapMeta(signal);
             const mt4Quote = findMt4Quote(symbol.symbol, quotesBySymbol);
             const quoteIsFresh = quoteWithinAgeLimit(mt4Quote?.timestamp);
             const effectiveQuote = quoteIsFresh ? mt4Quote : null;
@@ -349,8 +390,8 @@ function AgentCard({
                   <Text style={[styles.forexCell, styles.cellTimeframe]}>{signal.timeframe}</Text>
                   <Text style={[styles.forexCell, styles.cellTrend, { color: directionColor(signal.direction) }]}>{signal.direction.toUpperCase()}</Text>
                   <Text style={[styles.forexCell, styles.cellSignal]}>{signal.pattern.toUpperCase()}</Text>
-                  <Text style={[styles.forexCell, styles.cellConfidence]}>
-                    {signal.confidence}%/{typeof signal.calibratedConfidence === "number" ? `${signal.calibratedConfidence}%` : "-"}
+                  <Text style={[styles.forexCell, styles.cellConfidence, { color: confidenceMeta.color }]}>
+                    {confidenceMeta.text}
                   </Text>
                   <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(signal.tradePlan.entry)}</Text>
                   <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(signal.tradePlan.stopLoss)}</Text>
@@ -370,6 +411,7 @@ function AgentCard({
                   <View style={styles.analysisPanel}>
                     <Text style={styles.analysisTitle}>{symbol.symbol} analysis</Text>
                     <Text style={styles.analysisText}>{confidenceNarrative(signal)}</Text>
+                    <Text style={[styles.analysisText, { color: confidenceMeta.color }]}>Confidence gap: {confidenceMeta.toneLabel}</Text>
                     <Text style={styles.analysisText}>
                       Calibration bucket: {signal.calibrationBucket ?? "N/A"} | Sample size: {typeof signal.calibrationSampleSize === "number" ? signal.calibrationSampleSize : "N/A"}
                     </Text>
@@ -384,15 +426,18 @@ function AgentCard({
         </View>
       ) : (
         <View style={styles.symbolBlock}>
-          {agent.symbols.map((symbol) => (
+          {agent.symbols.map((symbol) => {
+            const confidenceMeta = confidenceGapMeta(symbol.bestSignal);
+
+            return (
             <View key={symbol.symbol} style={styles.symbolCard}>
             <View style={styles.symbolHeader}>
               <Text style={styles.symbol}>{symbol.symbol}</Text>
               <Text style={styles.symbolPrice}>{formatPrice(symbol.currentPrice)}</Text>
             </View>
             <Text style={styles.symbolMeta}>Best timeframe {symbol.bestSignal.timeframe}</Text>
-            <Text style={styles.symbolMeta}>
-              {symbol.bestSignal.pattern.toUpperCase()} | {symbol.bestSignal.direction.toUpperCase()} | Raw {symbol.bestSignal.confidence}%{typeof symbol.bestSignal.calibratedConfidence === "number" ? ` | Cal ${symbol.bestSignal.calibratedConfidence}%` : ""}
+            <Text style={[styles.symbolMeta, { color: confidenceMeta.color }]}>
+              {symbol.bestSignal.pattern.toUpperCase()} | {symbol.bestSignal.direction.toUpperCase()} | {confidenceMeta.text} | {confidenceMeta.toneLabel}
             </Text>
             <Text style={styles.symbolMeta}>Occurred {formatTimestamp(symbol.bestSignal.lastOccurrenceAt)}</Text>
             <Text style={styles.symbolMeta}>
@@ -440,7 +485,8 @@ function AgentCard({
               );
             })()}
             </View>
-          ))}
+            );
+          })}
         </View>
       )}
 
