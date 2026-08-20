@@ -337,7 +337,7 @@ function AgentCard({
           <Text style={styles.forexTableHint}>
             Bid/Ask source: {mt4QuotesFresh ? "MT4 realtime feed" : "derived from market signal price"}
           </Text>
-          <Text style={styles.forexTableHint}>Rows older than 30s switch to derived values automatically.</Text>
+          <Text style={styles.forexTableHint}>Rows older than 30s or missing MT4 quote switch to derived values automatically.</Text>
           <View style={styles.forexTableHeaderRow}>
             <Text style={[styles.forexHeaderCell, styles.cellPair]}>Currency Pair</Text>
             <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Live Buy Price</Text>
@@ -358,13 +358,26 @@ function AgentCard({
             const signal = symbol.bestSignal;
             const confidenceMeta = confidenceGapMeta(signal);
             const mt4Quote = findMt4Quote(symbol.symbol, quotesBySymbol);
+            const hasMt4Quote = Boolean(mt4Quote);
             const quoteIsFresh = quoteWithinAgeLimit(mt4Quote?.timestamp);
             const effectiveQuote = quoteIsFresh ? mt4Quote : null;
             const liveBuy = effectiveQuote?.ask ?? estimateBuyPrice(signal);
             const liveSell = effectiveQuote?.bid ?? estimateSellPrice(signal);
-            const liveTime = effectiveQuote ? formatAestTimestamp(effectiveQuote.timestamp) : "-";
-            const liveAge = effectiveQuote ? quoteAgeLabel(effectiveQuote.timestamp) : "STALE >30s";
-            const liveTimeColor = effectiveQuote ? quoteFreshnessColor(effectiveQuote.timestamp) : theme.colors.negative;
+            const liveTime = effectiveQuote
+              ? formatAestTimestamp(effectiveQuote.timestamp)
+              : hasMt4Quote
+                ? formatAestTimestamp(mt4Quote?.timestamp)
+                : "-";
+            const liveAge = effectiveQuote
+              ? quoteAgeLabel(effectiveQuote.timestamp)
+              : hasMt4Quote
+                ? "STALE >30s"
+                : "NO MT4";
+            const liveTimeColor = effectiveQuote
+              ? quoteFreshnessColor(effectiveQuote.timestamp)
+              : hasMt4Quote
+                ? theme.colors.negative
+                : theme.colors.muted;
             const analysisKey = `${agent.agent}:${symbol.symbol}:${signal.timeframe}`;
             const analysisOpen = selectedAnalysisKey === analysisKey;
 
