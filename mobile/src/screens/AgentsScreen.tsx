@@ -1,11 +1,11 @@
 import { useState } from "react";
 import { Linking, Platform, Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
-import { fetchMarketAgents, fetchMt4Quotes } from "../api/client";
+import { fetchForexMonitoringReport, fetchMarketAgents, fetchMt4Quotes } from "../api/client";
 import { API_BASE_URL, REFRESH_INTERVAL_MS } from "../constants";
 import { usePollingData } from "../hooks/usePollingData";
 import { theme } from "../theme";
 import { SectionCard } from "../components/SectionCard";
-import { MarketAgentReport, MarketAgentTimeframeSignal, Mt4Quote } from "../types";
+import { ForexTradeMonitoringReport, MarketAgentReport, MarketAgentTimeframeSignal, Mt4Quote } from "../types";
 
 const TIMEFRAME_ORDER: Record<string, number> = {
   "1hour": 1,
@@ -121,6 +121,26 @@ function formatAestTimestamp(timestamp?: string) {
   }
 }
 
+function formatMonitoringTimestamp(timestamp?: string) {
+  if (!timestamp) {
+    return "-";
+  }
+
+  try {
+    return new Date(timestamp).toLocaleString([], {
+      timeZone: "Australia/Sydney",
+      day: "2-digit",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    });
+  } catch {
+    return timestamp;
+  }
+}
+
 function quoteFreshnessColor(timestamp?: string) {
   if (!timestamp) {
     return theme.colors.muted;
@@ -183,10 +203,28 @@ function confidenceNarrative(signal: MarketAgentTimeframeSignal) {
   const calibrated = typeof signal.calibratedConfidence === "number"
     ? `${signal.calibratedConfidence}%`
     : "N/A";
+  const volumeRatio = typeof signal.volumeRatio === "number" ? `${signal.volumeRatio.toFixed(2)}x` : "N/A";
+  const volumeImpact = typeof signal.volumeImpactScore === "number"
+    ? `${signal.volumeImpactScore >= 0 ? "+" : ""}${signal.volumeImpactScore}`
+    : "0";
+  const trendImpact = typeof signal.trendImpactScore === "number"
+    ? `${signal.trendImpactScore >= 0 ? "+" : ""}${signal.trendImpactScore}`
+    : "0";
+  const historicalRecurrence = typeof signal.historicalRecurrenceScore === "number"
+    ? `${signal.historicalRecurrenceScore >= 0 ? "+" : ""}${signal.historicalRecurrenceScore}`
+    : "0";
+  const sentimentFlowImpact = typeof signal.sentimentFlowImpactScore === "number"
+    ? `${signal.sentimentFlowImpactScore >= 0 ? "+" : ""}${signal.sentimentFlowImpactScore}`
+    : "0";
   const pieces = [
     `${signal.pattern.toUpperCase()} confidence raw ${signal.confidence}% / calibrated ${calibrated}`,
+    `Volume ${String(signal.volumeConfirmation ?? "unavailable").toUpperCase()} ${volumeRatio} (impact ${volumeImpact})`,
+    `Trend structure impact ${trendImpact}`,
+    `Historical recurrence ${historicalRecurrence}`,
+    `Sentiment/Flow impact ${sentimentFlowImpact}`,
     `Confluence ${signal.deepDive.confluenceScore}`,
-    `MACD histogram ${formatSigned(signal.technicals.macdHistogram, 4)}`,
+    `Momentum read RSI ${signal.technicals.rsi14.toFixed(2)} | MACD ${formatSigned(signal.technicals.macdHistogram, 4)}`,
+    `Bollinger width ${signal.technicals.bollingerWidthPercent.toFixed(2)}% | ATR ${signal.technicals.atrPercent.toFixed(2)}% | IV proxy ${signal.technicals.impliedVolatilityPercent.toFixed(2)}% | Vol ${signal.technicals.volatilityPercent.toFixed(2)}%`,
     `EMA20 vs EMA50 ${formatPrice(signal.technicals.ema20)} / ${formatPrice(signal.technicals.ema50)}`,
     `Fundamental bias ${signal.fundamentals.bias.toUpperCase()} (${signal.fundamentals.macroScore})`
   ];
@@ -226,8 +264,128 @@ function confidenceGapMeta(signal: MarketAgentTimeframeSignal) {
   };
 }
 
+function formatNumber(value: number) {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+
+  return value.toFixed(1);
+}
+
+function formatCandlestickPattern(pattern?: string) {
+  if (!pattern || pattern === "none") {
+    return "None";
+  }
+
+  return pattern
+    .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function candlestickImpactColor(score?: number) {
+  if (typeof score !== "number") {
+    return theme.colors.muted;
+  }
+
+  if (score >= 4) {
+    return theme.colors.positive;
+  }
+
+  if (score <= -4) {
+    return theme.colors.negative;
+  }
+
+  return theme.colors.warning;
+}
+
+function volumeImpactColor(score?: number, confirmation?: "strong" | "weak" | "neutral" | "unavailable") {
+  if (confirmation === "unavailable") {
+    return theme.colors.muted;
+  }
+
+  if (typeof score !== "number") {
+    return theme.colors.muted;
+  }
+
+  if (score > 0) {
+    return theme.colors.positive;
+  }
+
+  if (score < 0) {
+    return theme.colors.negative;
+  }
+
+  return theme.colors.warning;
+}
+
+function trendImpactColor(score?: number) {
+  if (typeof score !== "number") {
+    return theme.colors.muted;
+  }
+
+  if (score > 0) {
+    return theme.colors.positive;
+  }
+
+  if (score < 0) {
+    return theme.colors.negative;
+  }
+
+  return theme.colors.warning;
+}
+
+function sentimentFlowImpactColor(score?: number) {
+  if (typeof score !== "number") {
+    return theme.colors.muted;
+  }
+
+  if (score > 0) {
+    return theme.colors.positive;
+  }
+
+  if (score < 0) {
+    return theme.colors.negative;
+  }
+
+  return theme.colors.warning;
+}
+
+function supportResistanceContextLabel(signal: MarketAgentTimeframeSignal) {
+  if (signal.isAtSupport && signal.isAtResistance) {
+    return "At S/R";
+  }
+
+  if (signal.isAtSupport) {
+    return "At Support";
+  }
+
+  if (signal.isAtResistance) {
+    return "At Resistance";
+  }
+
+  return "Mid Range";
+}
+
 function AgentSignalCard({ signal }: { signal: MarketAgentTimeframeSignal }) {
   const confidenceMeta = confidenceGapMeta(signal);
+  const candleLabel = formatCandlestickPattern(signal.candlestickPattern);
+  const candleImpact = typeof signal.candlestickImpactScore === "number"
+    ? `${signal.candlestickImpactScore >= 0 ? "+" : ""}${signal.candlestickImpactScore}`
+    : "N/A";
+  const volumeRatio = typeof signal.volumeRatio === "number" ? `${signal.volumeRatio.toFixed(2)}x` : "N/A";
+  const volumeImpact = typeof signal.volumeImpactScore === "number"
+    ? `${signal.volumeImpactScore >= 0 ? "+" : ""}${signal.volumeImpactScore}`
+    : "0";
+  const trendImpact = typeof signal.trendImpactScore === "number"
+    ? `${signal.trendImpactScore >= 0 ? "+" : ""}${signal.trendImpactScore}`
+    : "0";
+  const sentimentFlowImpact = typeof signal.sentimentFlowImpactScore === "number"
+    ? `${signal.sentimentFlowImpactScore >= 0 ? "+" : ""}${signal.sentimentFlowImpactScore}`
+    : "0";
+  const sentimentFlowBreakdown = signal.sentimentFlowBreakdown;
+  const volumeState = String(signal.volumeConfirmation ?? "unavailable").toUpperCase();
+  const srContext = supportResistanceContextLabel(signal);
 
   return (
     <View style={styles.signalCard}>
@@ -240,6 +398,23 @@ function AgentSignalCard({ signal }: { signal: MarketAgentTimeframeSignal }) {
       <Text style={[styles.signalMeta, { color: confidenceMeta.color }]}>Confidence gap: {confidenceMeta.toneLabel}</Text>
       <Text style={styles.signalMeta}>Occurred {formatTimestamp(signal.lastOccurrenceAt)}</Text>
       <Text style={styles.signalMeta}>Price {formatPrice(signal.currentPrice)} | Source {signal.source}</Text>
+      <Text style={[styles.signalMeta, { color: candlestickImpactColor(signal.candlestickImpactScore) }]}>
+        Candlestick {candleLabel} | Bias {signal.candlestickBias?.toUpperCase() ?? "N/A"} | Impact {candleImpact} | {srContext}
+      </Text>
+      <Text style={[styles.signalMeta, { color: volumeImpactColor(signal.volumeImpactScore, signal.volumeConfirmation) }]}>
+        Volume {volumeState} | Ratio {volumeRatio} | Impact {volumeImpact}
+      </Text>
+      <Text style={[styles.signalMeta, { color: trendImpactColor(signal.trendImpactScore) }]}>
+        Trend structure impact {trendImpact}
+      </Text>
+      <Text style={[styles.signalMeta, { color: sentimentFlowImpactColor(signal.sentimentFlowImpactScore) }]}>
+        Sentiment/Flow impact {sentimentFlowImpact} {signal.sentimentFlowSummary ? `| ${signal.sentimentFlowSummary}` : ""}
+      </Text>
+      {sentimentFlowBreakdown ? (
+        <Text style={styles.signalMeta}>
+          S/F factors: COT {sentimentFlowBreakdown.cotReport >= 0 ? "+" : ""}{sentimentFlowBreakdown.cotReport} | Rates {sentimentFlowBreakdown.interestRateDifferential >= 0 ? "+" : ""}{sentimentFlowBreakdown.interestRateDifferential} | CB {sentimentFlowBreakdown.centralBankCommentary >= 0 ? "+" : ""}{sentimentFlowBreakdown.centralBankCommentary} | Risk {sentimentFlowBreakdown.riskOnRiskOff >= 0 ? "+" : ""}{sentimentFlowBreakdown.riskOnRiskOff} | Options {sentimentFlowBreakdown.optionsMarket >= 0 ? "+" : ""}{sentimentFlowBreakdown.optionsMarket} | Retail {sentimentFlowBreakdown.retailPositioning >= 0 ? "+" : ""}{sentimentFlowBreakdown.retailPositioning} | Calendar {sentimentFlowBreakdown.economicCalendar >= 0 ? "+" : ""}{sentimentFlowBreakdown.economicCalendar}
+        </Text>
+      ) : null}
       <Text style={styles.signalNote}>{signal.strategySummary}</Text>
       <Text style={styles.signalNote}>
         Entry {formatPrice(signal.tradePlan.entry)} | SL {formatPrice(signal.tradePlan.stopLoss)} | TP {formatPrice(signal.tradePlan.takeProfit)} | Trailing SL {formatPrice(signal.tradePlan.trailingStopLoss)}
@@ -286,6 +461,7 @@ function AgentCard({
 }) {
   const isForexAgent = agent.agent === "Forex";
   const bestSignalConfidenceMeta = confidenceGapMeta(agent.bestSignal);
+  const [showStrongCandleOnly, setShowStrongCandleOnly] = useState(false);
 
   return (
     <View style={styles.agentCard}>
@@ -338,23 +514,49 @@ function AgentCard({
             Bid/Ask source: {mt4QuotesFresh ? "MT4 realtime feed" : "derived from market signal price"}
           </Text>
           <Text style={styles.forexTableHint}>Rows older than 30s switch to LIVE OFFLINE and use derived values automatically.</Text>
+          <View style={styles.forexFilterRow}>
+            <Pressable
+              style={[styles.forexFilterButton, showStrongCandleOnly ? styles.forexFilterButtonActive : null]}
+              onPress={() => setShowStrongCandleOnly((previous) => !previous)}
+            >
+              <Text style={[styles.forexFilterButtonText, showStrongCandleOnly ? styles.forexFilterButtonTextActive : null]}>
+                {showStrongCandleOnly ? "Showing Strong Candle Impact Only" : "Show Strong Candle Impact Only"}
+              </Text>
+            </Pressable>
+            <Text style={styles.forexFilterCount}>
+              {(() => {
+                const visibleCount = agent.symbols.filter((item) => {
+                  const score = item.bestSignal.candlestickImpactScore;
+                  return !showStrongCandleOnly || (typeof score === "number" && Math.abs(score) >= 4);
+                }).length;
+                return `${visibleCount}/${agent.symbols.length} rows`;
+              })()}
+            </Text>
+          </View>
           <View style={styles.forexTableHeaderRow}>
             <Text style={[styles.forexHeaderCell, styles.cellPair]}>Currency Pair</Text>
             <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Live Buy Price</Text>
             <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Live Sell Price</Text>
             <Text style={[styles.forexHeaderCell, styles.cellLiveTime]}>Live Time (AEST)</Text>
             <Text style={[styles.forexHeaderCell, styles.cellTimeframe]}>Time Frame</Text>
-            <Text style={[styles.forexHeaderCell, styles.cellTrend]}>Trend</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellTrend]}>Trend/Impact</Text>
             <Text style={[styles.forexHeaderCell, styles.cellSignal]}>Signal</Text>
             <Text style={[styles.forexHeaderCell, styles.cellConfidence]}>Confidence (R/C)</Text>
             <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Entry</Text>
             <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Stop loss</Text>
             <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Take profit</Text>
             <Text style={[styles.forexHeaderCell, styles.cellRr]}>R:R</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellCandle]}>Candle/SR</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellVolume]}>Volume</Text>
             <Text style={[styles.forexHeaderCell, styles.cellAnalysis]}>Analysis</Text>
           </View>
 
-          {agent.symbols.map((symbol) => {
+          {agent.symbols
+            .filter((item) => {
+              const score = item.bestSignal.candlestickImpactScore;
+              return !showStrongCandleOnly || (typeof score === "number" && Math.abs(score) >= 4);
+            })
+            .map((symbol) => {
             const signal = symbol.bestSignal;
             const confidenceMeta = confidenceGapMeta(signal);
             const mt4Quote = findMt4Quote(symbol.symbol, quotesBySymbol);
@@ -380,6 +582,23 @@ function AgentCard({
                 : theme.colors.muted;
             const analysisKey = `${agent.agent}:${symbol.symbol}:${signal.timeframe}`;
             const analysisOpen = selectedAnalysisKey === analysisKey;
+            const candleLabel = formatCandlestickPattern(signal.candlestickPattern);
+            const candleImpact = typeof signal.candlestickImpactScore === "number"
+              ? `${signal.candlestickImpactScore >= 0 ? "+" : ""}${signal.candlestickImpactScore}`
+              : "N/A";
+            const volumeRatio = typeof signal.volumeRatio === "number" ? `${signal.volumeRatio.toFixed(2)}x` : "N/A";
+            const volumeImpact = typeof signal.volumeImpactScore === "number"
+              ? `${signal.volumeImpactScore >= 0 ? "+" : ""}${signal.volumeImpactScore}`
+              : "0";
+            const trendImpact = typeof signal.trendImpactScore === "number"
+              ? `${signal.trendImpactScore >= 0 ? "+" : ""}${signal.trendImpactScore}`
+              : "0";
+            const sentimentFlowImpact = typeof signal.sentimentFlowImpactScore === "number"
+              ? `${signal.sentimentFlowImpactScore >= 0 ? "+" : ""}${signal.sentimentFlowImpactScore}`
+              : "0";
+            const sentimentFlowBreakdown = signal.sentimentFlowBreakdown;
+            const volumeState = String(signal.volumeConfirmation ?? "unavailable").toUpperCase();
+            const srContext = supportResistanceContextLabel(signal);
 
             return (
               <View key={symbol.symbol} style={styles.forexRowWrap}>
@@ -401,7 +620,11 @@ function AgentCard({
                     {liveTime}{liveAge ? ` (${liveAge})` : ""}
                   </Text>
                   <Text style={[styles.forexCell, styles.cellTimeframe]}>{signal.timeframe}</Text>
-                  <Text style={[styles.forexCell, styles.cellTrend, { color: directionColor(signal.direction) }]}>{signal.direction.toUpperCase()}</Text>
+                  <Text style={[styles.forexCell, styles.cellTrend, { color: directionColor(signal.direction) }]}>
+                    {signal.direction.toUpperCase()}
+                    {"\n"}
+                    <Text style={{ color: trendImpactColor(signal.trendImpactScore) }}>{`I ${trendImpact}`}</Text>
+                  </Text>
                   <Text style={[styles.forexCell, styles.cellSignal]}>{signal.pattern.toUpperCase()}</Text>
                   <Text style={[styles.forexCell, styles.cellConfidence, { color: confidenceMeta.color }]}>
                     {confidenceMeta.text}
@@ -410,6 +633,16 @@ function AgentCard({
                   <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(signal.tradePlan.stopLoss)}</Text>
                   <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(signal.tradePlan.takeProfit)}</Text>
                   <Text style={[styles.forexCell, styles.cellRr]}>1:{signal.tradePlan.riskRewardRatio.toFixed(2)}</Text>
+                  <Text style={[styles.forexCell, styles.cellCandle, { color: candlestickImpactColor(signal.candlestickImpactScore) }]}>
+                    {candleLabel}
+                    {"\n"}
+                    {`Impact ${candleImpact} | ${srContext}`}
+                  </Text>
+                  <Text style={[styles.forexCell, styles.cellVolume, { color: volumeImpactColor(signal.volumeImpactScore, signal.volumeConfirmation) }]}>
+                    {volumeState}
+                    {"\n"}
+                    {`R ${volumeRatio} | I ${volumeImpact}`}
+                  </Text>
                   <Pressable
                     style={[styles.analysisButton, analysisOpen ? styles.analysisButtonActive : null]}
                     onPress={() => onToggleAnalysis(analysisKey)}
@@ -428,6 +661,32 @@ function AgentCard({
                     <Text style={styles.analysisText}>
                       Calibration bucket: {signal.calibrationBucket ?? "N/A"} | Sample size: {typeof signal.calibrationSampleSize === "number" ? signal.calibrationSampleSize : "N/A"}
                     </Text>
+                    <Text style={[styles.analysisText, { color: candlestickImpactColor(signal.candlestickImpactScore) }]}>
+                      Candlestick: {candleLabel} | Bias {signal.candlestickBias?.toUpperCase() ?? "N/A"} | Impact {candleImpact} | {srContext}
+                    </Text>
+                    <Text style={[styles.analysisText, { color: volumeImpactColor(signal.volumeImpactScore, signal.volumeConfirmation) }]}>
+                      Volume: {volumeState} | Ratio {volumeRatio} | Impact {volumeImpact}
+                    </Text>
+                    <Text style={[styles.analysisText, { color: trendImpactColor(signal.trendImpactScore) }]}>
+                      Trend structure impact: {trendImpact}
+                    </Text>
+                    <Text style={styles.analysisText}>
+                      Historical recurrence: {signal.historicalRecurrenceSummary ?? "No comparable prior zone repeats found."} | impact {historicalRecurrence}
+                    </Text>
+                    <Text style={styles.analysisText}>
+                      Volatility regime: Bollinger width {signal.technicals.bollingerWidthPercent.toFixed(2)}% | ATR {signal.technicals.atrPercent.toFixed(2)}% | IV proxy {signal.technicals.impliedVolatilityPercent.toFixed(2)}% | Vol {signal.technicals.volatilityPercent.toFixed(2)}%
+                    </Text>
+                    <Text style={styles.analysisText}>
+                      Momentum read: RSI {signal.technicals.rsi14.toFixed(2)} | MACD hist {formatSigned(signal.technicals.macdHistogram, 4)}
+                    </Text>
+                    <Text style={[styles.analysisText, { color: sentimentFlowImpactColor(signal.sentimentFlowImpactScore) }]}>
+                      Sentiment/Flow impact: {sentimentFlowImpact} {signal.sentimentFlowSummary ? `| ${signal.sentimentFlowSummary}` : ""}
+                    </Text>
+                    {sentimentFlowBreakdown ? (
+                      <Text style={styles.analysisText}>
+                        Sentiment/Flow factors: COT {sentimentFlowBreakdown.cotReport >= 0 ? "+" : ""}{sentimentFlowBreakdown.cotReport} | Rates {sentimentFlowBreakdown.interestRateDifferential >= 0 ? "+" : ""}{sentimentFlowBreakdown.interestRateDifferential} | CB {sentimentFlowBreakdown.centralBankCommentary >= 0 ? "+" : ""}{sentimentFlowBreakdown.centralBankCommentary} | Risk {sentimentFlowBreakdown.riskOnRiskOff >= 0 ? "+" : ""}{sentimentFlowBreakdown.riskOnRiskOff} | Options {sentimentFlowBreakdown.optionsMarket >= 0 ? "+" : ""}{sentimentFlowBreakdown.optionsMarket} | Retail {sentimentFlowBreakdown.retailPositioning >= 0 ? "+" : ""}{sentimentFlowBreakdown.retailPositioning} | Calendar {sentimentFlowBreakdown.economicCalendar >= 0 ? "+" : ""}{sentimentFlowBreakdown.economicCalendar}
+                      </Text>
+                    ) : null}
                     <Text style={styles.analysisText}>Strategies: {signal.strategiesApplied.join(" | ")}</Text>
                     <Text style={styles.analysisText}>Technical: {signal.technicals.summary}</Text>
                     <Text style={styles.analysisText}>Fundamental: {signal.fundamentals.summary}</Text>
@@ -435,12 +694,34 @@ function AgentCard({
                 ) : null}
               </View>
             );
-          })}
+            })}
+
+          {showStrongCandleOnly && agent.symbols.every((item) => {
+            const score = item.bestSignal.candlestickImpactScore;
+            return !(typeof score === "number" && Math.abs(score) >= 4);
+          }) ? (
+            <View style={styles.forexEmptyState}>
+              <Text style={styles.forexEmptyStateText}>No strong candlestick-impact rows right now.</Text>
+            </View>
+          ) : null}
         </View>
       ) : (
         <View style={styles.symbolBlock}>
           {agent.symbols.map((symbol) => {
             const confidenceMeta = confidenceGapMeta(symbol.bestSignal);
+            const candleLabel = formatCandlestickPattern(symbol.bestSignal.candlestickPattern);
+            const candleImpact = typeof symbol.bestSignal.candlestickImpactScore === "number"
+              ? `${symbol.bestSignal.candlestickImpactScore >= 0 ? "+" : ""}${symbol.bestSignal.candlestickImpactScore}`
+              : "N/A";
+            const volumeRatio = typeof symbol.bestSignal.volumeRatio === "number" ? `${symbol.bestSignal.volumeRatio.toFixed(2)}x` : "N/A";
+            const volumeImpact = typeof symbol.bestSignal.volumeImpactScore === "number"
+              ? `${symbol.bestSignal.volumeImpactScore >= 0 ? "+" : ""}${symbol.bestSignal.volumeImpactScore}`
+              : "0";
+            const trendImpact = typeof symbol.bestSignal.trendImpactScore === "number"
+              ? `${symbol.bestSignal.trendImpactScore >= 0 ? "+" : ""}${symbol.bestSignal.trendImpactScore}`
+              : "0";
+            const volumeState = String(symbol.bestSignal.volumeConfirmation ?? "unavailable").toUpperCase();
+            const srContext = supportResistanceContextLabel(symbol.bestSignal);
 
             return (
             <View key={symbol.symbol} style={styles.symbolCard}>
@@ -464,6 +745,15 @@ function AgentCard({
             </Text>
             <Text style={styles.symbolMeta}>
               Fundamental {symbol.bestSignal.fundamentals.bias.toUpperCase()} | Macro {symbol.bestSignal.fundamentals.macroScore} | Setup {symbol.bestSignal.deepDive.setupQuality.toUpperCase()}
+            </Text>
+            <Text style={[styles.symbolMeta, { color: candlestickImpactColor(symbol.bestSignal.candlestickImpactScore) }]}>
+              Candlestick {candleLabel} | Bias {symbol.bestSignal.candlestickBias?.toUpperCase() ?? "N/A"} | Impact {candleImpact} | {srContext}
+            </Text>
+            <Text style={[styles.symbolMeta, { color: volumeImpactColor(symbol.bestSignal.volumeImpactScore, symbol.bestSignal.volumeConfirmation) }]}>
+              Volume {volumeState} | Ratio {volumeRatio} | Impact {volumeImpact}
+            </Text>
+            <Text style={[styles.symbolMeta, { color: trendImpactColor(symbol.bestSignal.trendImpactScore) }]}>
+              Trend structure impact {trendImpact}
             </Text>
 
             {(() => {
@@ -513,17 +803,23 @@ export function AgentsScreen() {
     keepPreviousDataOnError: false
   });
   const mt4QuotesFeed = usePollingData(fetchMt4Quotes, MT4_QUOTES_REFRESH_MS, "mt4-quotes");
+  const monitoringReportFeed = usePollingData(fetchForexMonitoringReport, REFRESH_INTERVAL_MS, "forex-monitoring-report");
   const { width } = useWindowDimensions();
   const [expandedSymbols, setExpandedSymbols] = useState<Record<string, boolean>>({});
   const [selectedAnalysisKey, setSelectedAnalysisKey] = useState<string | null>(null);
   const [selectedAgentKey, setSelectedAgentKey] = useState<string>(AGENT_MENU[0].key);
+  const [monitoringReportExpanded, setMonitoringReportExpanded] = useState(false);
 
   const agents = data?.data ?? [];
   const selectedMenu = AGENT_MENU.find((item) => item.key === selectedAgentKey) ?? AGENT_MENU[0];
   const selectedAgent = agents.find((agent) => agent.agent === selectedMenu.match) ?? agents[0] ?? null;
   const isCompactLayout = width < 900;
   const mt4Quotes = mt4QuotesFeed.data?.quotes ?? [];
-  const mt4QuotesBySymbol = new Map(mt4Quotes.map((quote) => [normalizeForexSymbol(quote.symbol), quote] as const));
+  const mt4FeedTimestamp = mt4QuotesFeed.data?.receivedAt ?? mt4QuotesFeed.data?.timestamp;
+  const mt4QuotesBySymbol = new Map(mt4Quotes.map((quote) => [
+    normalizeForexSymbol(quote.symbol),
+    mt4FeedTimestamp ? { ...quote, timestamp: mt4FeedTimestamp } : quote
+  ] as const));
   const mt4QuotesFresh = mt4QuotesFeed.data?.healthStatus === "fresh" && mt4Quotes.length > 0;
   const monitoringReportLink = `${API_BASE_URL.replace(/\/$/, "")}/api/market/forex-monitoring-report?format=html`;
   const monitoringHistoryLink = `${API_BASE_URL.replace(/\/$/, "")}/api/market/forex-monitoring-history?days=10&format=html`;
@@ -594,10 +890,67 @@ export function AgentsScreen() {
         ) : null}
 
         <View style={styles.monitoringLinksWrap}>
-          <Text style={styles.monitoringLinksTitle}>Monitoring Links</Text>
+          <Pressable
+            style={[styles.monitoringReportToggle, monitoringReportExpanded ? styles.monitoringReportToggleActive : null]}
+            onPress={() => setMonitoringReportExpanded((previous) => !previous)}
+          >
+            <Text style={[styles.monitoringLinksTitle, monitoringReportExpanded ? styles.monitoringLinksTitleActive : null]}>
+              {monitoringReportExpanded ? "Hide Forex Trade Monitoring Report" : "Forex Trade Monitoring Report"}
+            </Text>
+            <Text style={[styles.monitoringReportHint, monitoringReportExpanded ? styles.monitoringReportHintActive : null]}>
+              {monitoringReportExpanded ? "Tap to collapse details" : "Tap to show only today\'s qualifying trades"}
+            </Text>
+          </Pressable>
+
+          {monitoringReportExpanded ? (
+            <View style={styles.monitoringReportCard}>
+              {monitoringReportFeed.loading ? <Text style={styles.muted}>Loading monitoring report...</Text> : null}
+              {monitoringReportFeed.error && !monitoringReportFeed.data ? <Text style={styles.error}>{monitoringReportFeed.error}</Text> : null}
+              {monitoringReportFeed.data ? (
+                <>
+                  <Text style={styles.monitoringReportMeta}>
+                    Day {monitoringReportFeed.data.monitoringDayKey} | Time zone {monitoringReportFeed.data.monitoringTimeZone} | Confidence &ge; {monitoringReportFeed.data.confidenceThreshold}%
+                  </Text>
+                  <View style={styles.monitoringStatsGrid}>
+                    <View style={styles.monitoringStat}><Text style={styles.monitoringStatLabel}>Total</Text><Text style={styles.monitoringStatValue}>{monitoringReportFeed.data.totalTrades}</Text></View>
+                    <View style={styles.monitoringStat}><Text style={styles.monitoringStatLabel}>Open</Text><Text style={styles.monitoringStatValue}>{monitoringReportFeed.data.openCount}</Text></View>
+                    <View style={styles.monitoringStat}><Text style={styles.monitoringStatLabel}>TP</Text><Text style={styles.monitoringStatValue}>{monitoringReportFeed.data.tpHitCount}</Text></View>
+                    <View style={styles.monitoringStat}><Text style={styles.monitoringStatLabel}>SL</Text><Text style={styles.monitoringStatValue}>{monitoringReportFeed.data.slHitCount}</Text></View>
+                    <View style={styles.monitoringStat}><Text style={styles.monitoringStatLabel}>Resolved</Text><Text style={styles.monitoringStatValue}>{monitoringReportFeed.data.resolvedTrades}</Text></View>
+                    <View style={styles.monitoringStat}><Text style={styles.monitoringStatLabel}>Win rate</Text><Text style={styles.monitoringStatValue}>{formatNumber(monitoringReportFeed.data.winRatePercent)}%</Text></View>
+                  </View>
+
+                  <View style={styles.monitoringTableBlock}>
+                    <View style={styles.monitoringTableHeaderRow}>
+                      <Text style={[styles.monitoringHeaderCell, styles.monitoringCellTrade]}>Symbol</Text>
+                      <Text style={styles.monitoringHeaderCell}>TF</Text>
+                      <Text style={styles.monitoringHeaderCell}>Status</Text>
+                      <Text style={styles.monitoringHeaderCell}>Entry</Text>
+                      <Text style={styles.monitoringHeaderCell}>SL</Text>
+                      <Text style={styles.monitoringHeaderCell}>TP</Text>
+                    </View>
+                    {monitoringReportFeed.data.items.map((item) => {
+                      const statusColor = item.status === "tp-hit" ? theme.colors.positive : item.status === "sl-hit" ? theme.colors.negative : theme.colors.warning;
+                      return (
+                        <View key={item.tradeId} style={styles.monitoringTableRow}>
+                          <Text style={[styles.monitoringCell, styles.monitoringCellTrade]}>{item.symbol}</Text>
+                          <Text style={styles.monitoringCell}>{item.timeframe}</Text>
+                          <Text style={[styles.monitoringCell, { color: statusColor }]}>{item.status.toUpperCase()}</Text>
+                          <Text style={styles.monitoringCell}>{formatPrice(item.entry)}</Text>
+                          <Text style={styles.monitoringCell}>{formatPrice(item.stopLoss)}</Text>
+                          <Text style={styles.monitoringCell}>{formatPrice(item.takeProfit)}</Text>
+                        </View>
+                      );
+                    })}
+                  </View>
+                </>
+              ) : null}
+            </View>
+          ) : null}
+
           <Pressable onPress={() => void Linking.openURL(monitoringReportLink)}>
             <Text style={styles.monitoringLink} accessibilityRole="link">
-              Forex Trade Monitoring Report (HTML)
+              Open HTML report
             </Text>
           </Pressable>
           <Pressable onPress={() => void Linking.openURL(monitoringHistoryLink)}>
@@ -631,11 +984,106 @@ const styles = StyleSheet.create({
     borderTopColor: "#1f4358",
     paddingTop: 10
   },
+  monitoringReportToggle: {
+    borderWidth: 1,
+    borderColor: "#24566f",
+    backgroundColor: "#102b3b",
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 10
+  },
+  monitoringReportToggleActive: {
+    borderColor: theme.colors.accent,
+    backgroundColor: "#0b1d29"
+  },
   monitoringLinksTitle: {
     color: theme.colors.accent,
     fontSize: 12,
     fontWeight: "800",
     marginBottom: 6
+  },
+  monitoringLinksTitleActive: {
+    marginBottom: 2
+  },
+  monitoringReportHint: {
+    color: theme.colors.muted,
+    fontSize: 11
+  },
+  monitoringReportHintActive: {
+    color: theme.colors.text
+  },
+  monitoringReportCard: {
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: "#24566f",
+    borderRadius: 12,
+    backgroundColor: "#0e2230",
+    padding: 10,
+    gap: 8
+  },
+  monitoringReportMeta: {
+    color: theme.colors.muted,
+    fontSize: 11,
+    lineHeight: 15
+  },
+  monitoringStatsGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8
+  },
+  monitoringStat: {
+    minWidth: 96,
+    borderWidth: 1,
+    borderColor: "#1f4358",
+    borderRadius: 10,
+    backgroundColor: "#102b3b",
+    paddingHorizontal: 8,
+    paddingVertical: 8
+  },
+  monitoringStatLabel: {
+    color: theme.colors.muted,
+    fontSize: 10,
+    fontWeight: "700",
+    marginBottom: 2
+  },
+  monitoringStatValue: {
+    color: theme.colors.text,
+    fontSize: 14,
+    fontWeight: "800"
+  },
+  monitoringTableBlock: {
+    borderWidth: 1,
+    borderColor: "#1f4358",
+    borderRadius: 10,
+    overflow: "hidden"
+  },
+  monitoringTableHeaderRow: {
+    flexDirection: "row",
+    backgroundColor: "#0b1d29",
+    borderBottomWidth: 1,
+    borderBottomColor: "#17384b"
+  },
+  monitoringTableRow: {
+    flexDirection: "row",
+    borderBottomWidth: 1,
+    borderBottomColor: "#17384b"
+  },
+  monitoringHeaderCell: {
+    color: theme.colors.accent,
+    fontSize: 10,
+    fontWeight: "800",
+    paddingHorizontal: 6,
+    paddingVertical: 8
+  },
+  monitoringCell: {
+    color: theme.colors.text,
+    fontSize: 10,
+    paddingHorizontal: 6,
+    paddingVertical: 8
+  },
+  monitoringCellTrade: {
+    flex: 1.2
   },
   monitoringLink: {
     color: "#65b9ff",
@@ -866,6 +1314,50 @@ const styles = StyleSheet.create({
     fontSize: 11,
     marginBottom: 8
   },
+  forexFilterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 8,
+    gap: 8,
+    paddingHorizontal: 10
+  },
+  forexFilterButton: {
+    borderWidth: 1,
+    borderColor: "#24566f",
+    borderRadius: 999,
+    backgroundColor: "#0b1d29",
+    paddingHorizontal: 10,
+    paddingVertical: 6
+  },
+  forexFilterButtonActive: {
+    borderColor: theme.colors.accent,
+    backgroundColor: theme.colors.accent
+  },
+  forexFilterButtonText: {
+    color: theme.colors.text,
+    fontSize: 10,
+    fontWeight: "700"
+  },
+  forexFilterButtonTextActive: {
+    color: "#03222f"
+  },
+  forexFilterCount: {
+    color: theme.colors.muted,
+    fontSize: 10,
+    fontWeight: "700"
+  },
+  forexEmptyState: {
+    borderTopWidth: 1,
+    borderColor: "#17384b",
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    backgroundColor: "#0b1d29"
+  },
+  forexEmptyStateText: {
+    color: theme.colors.muted,
+    fontSize: 11
+  },
   cellConfidence: {
     flex: 0.9,
     fontWeight: "700"
@@ -873,6 +1365,16 @@ const styles = StyleSheet.create({
   cellRr: {
     flex: 0.85,
     fontWeight: "700"
+  },
+  cellCandle: {
+    flex: 1.55,
+    fontSize: 10,
+    lineHeight: 14
+  },
+  cellVolume: {
+    flex: 1.3,
+    fontSize: 10,
+    lineHeight: 14
   },
   cellAnalysis: {
     flex: 1,

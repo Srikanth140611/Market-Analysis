@@ -1,5 +1,6 @@
 import { getLiveForexSpotPrice } from "./marketService.js";
-import { getMarketHistory, type HistoryTimeframe, type MarketAssetCategory, type MarketPatternSignal, type HistorySource } from "./marketHistoryService.js";
+import { getLatestMt4Snapshot } from "./mt4Service.js";
+import { getMarketHistory, type HistoryTimeframe, type MarketAssetCategory, type MarketPatternSignal, type HistorySource, type CandlestickPattern } from "./marketHistoryService.js";
 
 export type MarketAgentName = "Forex" | "Commodities" | "Oil";
 
@@ -24,6 +25,9 @@ export type MarketAgentTechnicalAnalysis = {
   bollingerMiddle: number;
   bollingerLower: number;
   bollingerWidthPercent: number;
+  atrPercent: number;
+  impliedVolatilityPercent: number;
+  rsi14: number;
   macdLine: number;
   macdSignal: number;
   macdHistogram: number;
@@ -51,6 +55,17 @@ export type MarketAgentDeepDiveDimension = {
   fundamentalFocus: string[];
 };
 
+export type MarketAgentSentimentFlowBreakdown = {
+  cotReport: number;
+  interestRateDifferential: number;
+  centralBankCommentary: number;
+  riskOnRiskOff: number;
+  optionsMarket: number;
+  retailPositioning: number;
+  economicCalendar: number;
+  source: "proxy";
+};
+
 export type MarketAgentTimeframeSignal = {
   timeframe: MarketAgentAnalysisTimeframe;
   pattern: MarketPatternKind;
@@ -58,6 +73,20 @@ export type MarketAgentTimeframeSignal = {
   calibratedConfidence?: number;
   calibrationSampleSize?: number;
   calibrationBucket?: string;
+  candlestickPattern?: CandlestickPattern;
+  candlestickBias?: "up" | "down" | "neutral";
+  candlestickImpactScore?: number;
+  volumeRatio?: number | null;
+  volumeImpactScore?: number;
+  trendImpactScore?: number;
+  historicalRecurrenceScore?: number;
+  historicalRecurrenceSummary?: string;
+  sentimentFlowImpactScore?: number;
+  sentimentFlowSummary?: string;
+  sentimentFlowBreakdown?: MarketAgentSentimentFlowBreakdown;
+  volumeConfirmation?: "strong" | "weak" | "neutral" | "unavailable";
+  isAtSupport?: boolean;
+  isAtResistance?: boolean;
   direction: "up" | "down" | "neutral";
   currentPrice: number;
   lastOccurrenceAt: string;
@@ -225,8 +254,11 @@ const TIMEFRAME_WEIGHTS: Record<MarketAgentAnalysisTimeframe, number> = {
 };
 
 const CONFIDENCE_CALIBRATION_PRIOR_WEIGHT = 25;
+const MARKET_AGENTS_CACHE_TTL_MS = 20_000;
 
 const forexTradeLedger = new Map<string, ForexTradeMonitoringItem>();
+let marketAgentsCache: { value: MarketAgentsResponse; cachedAt: number } | null = null;
+let marketAgentsInFlight: Promise<MarketAgentsResponse> | null = null;
 
 function formatTimestamp(timestamp: number) {
   return new Date(timestamp).toISOString();
@@ -451,6 +483,31 @@ function sma(values: number[], period: number) {
   return slice.reduce((sum, value) => sum + value, 0) / slice.length;
 }
 
+function rsi(values: number[], period: number) {
+  if (values.length <= period) {
+    return 50;
+  }
+
+  let gains = 0;
+  let losses = 0;
+
+  for (let index = values.length - period; index < values.length; index += 1) {
+    const delta = values[index] - values[index - 1];
+    if (delta >= 0) {
+      gains += delta;
+    } else {
+      losses += Math.abs(delta);
+    }
+  }
+
+  if (losses === 0) {
+    return 100;
+  }
+
+  const relativeStrength = gains / losses;
+  return 100 - 100 / (1 + relativeStrength);
+}
+
 function standardDeviation(values: number[]) {
   if (values.length === 0) {
     return 0;
@@ -632,7 +689,81 @@ function buildTradePlan(price: number, support: number, resistance: number, dire
   };
 }
 
-function buildTechnicalAnalysis(symbol: string, timeframe: MarketAgentAnalysisTimeframe, candles: { t: number; o: number; h: number; l: number; c: number }[], support: number, resistance: number): MarketAgentTechnicalAnalysis {
+function trueRangeForCandles(candles: { t: number; o: number; h: number; l: number; c: number }[]) {
+  return candles.slice(1).map((candle, index) => {
+    const previous = candles[index];
+    const highLow = candle.h - candle.l;
+    const highPreviousClose = Math.abs(candle.h - previous.c);
+    const lowPreviousClose = Math.abs(candle.l - previous.c);
+    return Math.max(highLow, highPreviousClose, lowPreviousClose);
+  });
+}
+
+function calculateAtrPercent(candles: { t: number; o: number; h: number; l: number; c: number }[], currentPrice: number) {
+  if (candles.length < 2 || currentPrice <= 0) {
+    return 0;
+  }
+
+  const atrValues = trueRangeForCandles(candles).slice(-14);
+  const atr = atrValues.reduce((sum, value) => sum + value, 0) / Math.max(1, atrValues.length);
+  return (atr / currentPrice) * 100;
+}
+
+function calculateImpliedVolatilityProxy(bollingerWidthPercent: number, atrPercent: number) {
+  return clamp((bollingerWidthPercent * 0.75) + (atrPercent * 1.1), 0, 100);
+}
+
+export function computeVolatilityConfidenceAdjustment(technicals: Pick<MarketAgentTechnicalAnalysis, "bollingerWidthPercent" | "atrPercent" | "impliedVolatilityPercent">) {
+  let adjustment = 0;
+
+  if (technicals.bollingerWidthPercent < 0.8) {
+    adjustment += 4;
+  } else if (technicals.bollingerWidthPercent > 2.2) {
+    adjustment -= 2;
+  }
+
+  if (technicals.atrPercent < 0.8) {
+    adjustment += 2;
+  } else if (technicals.atrPercent > 1.8) {
+    adjustment -= 2;
+  }
+
+  if (technicals.impliedVolatilityPercent > 2.5) {
+    adjustment -= 3;
+  } else if (technicals.impliedVolatilityPercent < 1.1) {
+    adjustment += 2;
+  }
+
+  return clamp(adjustment, -6, 6);
+}
+
+export function computeOscillatorConfidenceAdjustment(technicals: Pick<MarketAgentTechnicalAnalysis, "rsi14" | "macdHistogram">) {
+  let adjustment = 0;
+
+  if (technicals.rsi14 <= 30) {
+    adjustment += 2;
+  } else if (technicals.rsi14 >= 70) {
+    adjustment -= 2;
+  }
+
+  if (technicals.macdHistogram > 0) {
+    adjustment += 1;
+  } else if (technicals.macdHistogram < 0) {
+    adjustment -= 1;
+  }
+
+  return clamp(adjustment, -4, 4);
+}
+
+export function computeHistoricalRecurrenceConfidenceAdjustment(score: number | undefined) {
+  if (typeof score !== "number" || !Number.isFinite(score)) {
+    return 0;
+  }
+
+  return Math.round(clamp(score, -6, 6));
+}
+
+export function buildTechnicalAnalysis(symbol: string, timeframe: MarketAgentAnalysisTimeframe, candles: { t: number; o: number; h: number; l: number; c: number }[], support: number, resistance: number): MarketAgentTechnicalAnalysis {
   const closes = candles.map((candle) => candle.c);
   const recentCloses = closes.slice(-20);
   const currentPrice = closes[closes.length - 1] ?? 0;
@@ -644,6 +775,9 @@ function buildTechnicalAnalysis(symbol: string, timeframe: MarketAgentAnalysisTi
   const bollingerUpper = bollingerMiddle + bollingerDeviation * 2;
   const bollingerLower = bollingerMiddle - bollingerDeviation * 2;
   const bollingerWidthPercent = currentPrice > 0 ? ((bollingerUpper - bollingerLower) / currentPrice) * 100 : 0;
+  const atrPercent = calculateAtrPercent(candles, currentPrice);
+  const impliedVolatilityPercent = calculateImpliedVolatilityProxy(bollingerWidthPercent, atrPercent);
+  const rsi14 = recentCloses.length >= 15 ? rsi(recentCloses, 14) : 50;
   const { macdLine, macdSignal, macdHistogram } = buildMacd(closes);
   const ranges = candles.slice(-20).map((candle) => candle.h - candle.l);
   const averageRange = ranges.reduce((sum, value) => sum + value, 0) / Math.max(1, ranges.length);
@@ -664,6 +798,9 @@ function buildTechnicalAnalysis(symbol: string, timeframe: MarketAgentAnalysisTi
     bollingerMiddle: roundTo(bollingerMiddle),
     bollingerLower: roundTo(bollingerLower),
     bollingerWidthPercent: roundTo(bollingerWidthPercent, 2),
+    atrPercent: roundTo(atrPercent, 2),
+    impliedVolatilityPercent: roundTo(impliedVolatilityPercent, 2),
+    rsi14: roundTo(rsi14, 2),
     macdLine: roundTo(macdLine, 4),
     macdSignal: roundTo(macdSignal, 4),
     macdHistogram: roundTo(macdHistogram, 4),
@@ -671,7 +808,7 @@ function buildTechnicalAnalysis(symbol: string, timeframe: MarketAgentAnalysisTi
     resistance: roundTo(resistance),
     volatilityPercent: roundTo(volatilityPercent, 2),
     trendStrength: roundTo(trendStrength, 2),
-    summary: `${symbol} ${timeframe} technicals: EMA20 ${roundTo(ema20)}, EMA50 ${roundTo(ema50)}, SMA50 ${roundTo(sma50)}, ${bollingerState}, ${macdState}.`
+    summary: `${symbol} ${timeframe} technicals: EMA20 ${roundTo(ema20)}, EMA50 ${roundTo(ema50)}, SMA50 ${roundTo(sma50)}, RSI ${roundTo(rsi14, 2)}, ${bollingerState}, ATR ${roundTo(atrPercent, 2)}%, IV proxy ${roundTo(impliedVolatilityPercent, 2)}%, ${macdState}.`
   };
 }
 
@@ -764,6 +901,7 @@ function buildDeepDiveDimension(
     `SMA50 ${technicals.sma50}`,
     `MACD histogram ${technicals.macdHistogram}`,
     `Bollinger width ${technicals.bollingerWidthPercent}%`,
+    `ATR ${technicals.atrPercent}% / IV proxy ${technicals.impliedVolatilityPercent}%`,
     `Support ${technicals.support} / Resistance ${technicals.resistance}`
   ];
   const fundamentalFocus = [...fundamentals.drivers.slice(0, 2), ...fundamentals.risks.slice(0, 1)];
@@ -771,7 +909,7 @@ function buildDeepDiveDimension(
   const setupQuality = confluenceScore >= 78 ? "high" : confluenceScore >= 62 ? "medium" : "watchlist";
 
   return {
-    skillDimensions: ["pattern-classification", "ema-trend-filter", "sma50-context", "bollinger-volatility", "macd-momentum", "support-resistance", "fundamental-catalyst-map", ...strategiesApplied.slice(0, 2)],
+    skillDimensions: ["pattern-classification", "candlestick-sr-impact", "ema-trend-filter", "sma50-context", "bollinger-volatility", "atr-volatility", "implied-volatility", "macd-momentum", "support-resistance", "fundamental-catalyst-map", ...strategiesApplied.slice(0, 2)],
     confluenceScore,
     setupQuality,
     technicalFocus,
@@ -779,14 +917,91 @@ function buildDeepDiveDimension(
   };
 }
 
-function strategySummary(pattern: MarketPatternSignal, direction: "up" | "down" | "neutral", technicals: MarketAgentTechnicalAnalysis, fundamentals: MarketAgentFundamentalAnalysis) {
+function scoreDirection(direction: "up" | "down" | "neutral") {
+  if (direction === "up") {
+    return 1;
+  }
+
+  if (direction === "down") {
+    return -1;
+  }
+
+  return 0;
+}
+
+function buildSentimentFlowProxy(
+  symbol: string,
+  timeframe: MarketAgentAnalysisTimeframe,
+  direction: "up" | "down" | "neutral",
+  pattern: MarketPatternKind,
+  technicals: MarketAgentTechnicalAnalysis,
+  fundamentals: MarketAgentFundamentalAnalysis
+): { impactScore: number; summary: string; breakdown: MarketAgentSentimentFlowBreakdown } {
+  const dir = scoreDirection(direction);
+  const trendBias = scoreDirection(technicals.ema20 >= technicals.ema50 ? "up" : "down");
+  const macdBias = scoreDirection(technicals.macdHistogram >= 0 ? "up" : "down");
+  const safeHavenCross = symbol.includes("JPY") || symbol.includes("CHF");
+  const highEventRiskWindow = timeframe === "1hour" || timeframe === "4hour";
+
+  const cotReport = clamp(Math.round((technicals.trendStrength - 45) / 20) * dir, -2, 2);
+  const interestRateDifferential = clamp((fundamentals.bias === "neutral" ? 0 : (fundamentals.bias === "bullish" ? 2 : -2)) + (dir * 1), -3, 3);
+  const centralBankCommentary = clamp((fundamentals.macroScore >= 68 ? 2 : fundamentals.macroScore >= 60 ? 1 : fundamentals.macroScore <= 52 ? -1 : 0) * (dir === 0 ? 1 : dir), -2, 2);
+  const riskOnRiskOff = clamp((safeHavenCross ? dir : trendBias) + (technicals.volatilityPercent > 1.1 ? -1 : 0), -2, 2);
+  const optionsMarket = clamp((macdBias === dir ? 1 : -1) + ((pattern === "breakout" || pattern === "trend") ? dir : 0), -2, 2);
+  const retailPositioning = clamp((dir === 0 ? 0 : -dir) + (pattern === "reversal" ? dir : 0), -2, 2);
+  const economicCalendar = clamp((highEventRiskWindow ? -1 : 0) + ((pattern === "breakout" || pattern === "momentum") ? dir : 0), -2, 2);
+
+  const rawImpact = cotReport
+    + interestRateDifferential
+    + centralBankCommentary
+    + riskOnRiskOff
+    + optionsMarket
+    + retailPositioning
+    + economicCalendar;
+  const impactScore = clamp(rawImpact, -10, 10);
+
+  const breakdown: MarketAgentSentimentFlowBreakdown = {
+    cotReport,
+    interestRateDifferential,
+    centralBankCommentary,
+    riskOnRiskOff,
+    optionsMarket,
+    retailPositioning,
+    economicCalendar,
+    source: "proxy"
+  };
+
+  const summary = [
+    `COT ${cotReport >= 0 ? "+" : ""}${cotReport}`,
+    `Rates ${interestRateDifferential >= 0 ? "+" : ""}${interestRateDifferential}`,
+    `CB ${centralBankCommentary >= 0 ? "+" : ""}${centralBankCommentary}`,
+    `Risk ${riskOnRiskOff >= 0 ? "+" : ""}${riskOnRiskOff}`,
+    `Options ${optionsMarket >= 0 ? "+" : ""}${optionsMarket}`,
+    `Retail ${retailPositioning >= 0 ? "+" : ""}${retailPositioning}`,
+    `Calendar ${economicCalendar >= 0 ? "+" : ""}${economicCalendar}`
+  ].join(" | ");
+
+  return { impactScore, summary, breakdown };
+}
+
+function strategySummary(
+  pattern: MarketPatternSignal,
+  direction: "up" | "down" | "neutral",
+  technicals: MarketAgentTechnicalAnalysis,
+  fundamentals: MarketAgentFundamentalAnalysis,
+  sentimentFlow: { impactScore: number; summary: string }
+) {
   const trendNote = direction === "up"
     ? "Bias is bullish until price loses support."
     : direction === "down"
       ? "Bias is bearish until price reclaims resistance."
       : "Bias is neutral pending confirmation.";
 
-  return `${pattern.pattern.toUpperCase()} on ${pattern.symbol} (${pattern.timeframe}) with ${Math.round(pattern.confidence)}% confidence. ${trendNote} ${technicals.summary} ${fundamentals.summary}`;
+  const candleContext = pattern.candlestickPattern && pattern.candlestickPattern !== "none"
+    ? `Candlestick ${pattern.candlestickPattern} (${pattern.candlestickBias}) impact ${pattern.candlestickImpactScore}.`
+    : "Candlestick impact neutral.";
+
+  return `${pattern.pattern.toUpperCase()} on ${pattern.symbol} (${pattern.timeframe}) with ${Math.round(pattern.confidence)}% baseline confidence. ${trendNote} ${candleContext} Sentiment/flow impact ${sentimentFlow.impactScore >= 0 ? "+" : ""}${sentimentFlow.impactScore} (${sentimentFlow.summary}). ${technicals.summary} ${fundamentals.summary}`;
 }
 
 function buildSignal(
@@ -798,18 +1013,27 @@ function buildSignal(
   source: HistorySource,
   liveSpotPrice?: number | null,
   calibrationStatsByTimeframe?: CalibrationStatsByTimeframe
-): MarketAgentTimeframeSignal {
+): MarketAgentTimeframeSignal | null {
+  if (!pattern.candlestickPattern || pattern.candlestickPattern === "none") {
+    return null;
+  }
+
   const latestCandle = candles[candles.length - 1] ?? null;
   const currentPrice = liveSpotPrice ?? latestCandle?.c ?? pattern.latestClose;
   const lastOccurrenceAt = latestCandle ? formatTimestamp(latestCandle.t > 1e12 ? latestCandle.t : latestCandle.t * 1000) : new Date().toISOString();
-  const confidence = Math.round(pattern.confidence);
+  const baseConfidence = Math.round(pattern.confidence);
+  const strategiesApplied = strategiesForPattern(pattern.pattern, pattern.direction, category, symbol);
+  const technicals = buildTechnicalAnalysis(symbol, timeframe, candles, pattern.support, pattern.resistance);
+  const fundamentals = buildFundamentalAnalysis(category, symbol, pattern.direction);
+  const sentimentFlow = buildSentimentFlowProxy(symbol, timeframe, pattern.direction, pattern.pattern, technicals, fundamentals);
+  const volatilityAdjustment = computeVolatilityConfidenceAdjustment(technicals);
+  const oscillatorAdjustment = computeOscillatorConfidenceAdjustment(technicals);
+  const historicalRecurrenceAdjustment = computeHistoricalRecurrenceConfidenceAdjustment(pattern.historicalRecurrenceScore);
+  const confidence = Math.round(clamp(baseConfidence + historicalRecurrenceAdjustment + sentimentFlow.impactScore + volatilityAdjustment + oscillatorAdjustment, 45, 94));
   const calibration = calibrationStatsByTimeframe
     ? calibrateConfidence(confidence, timeframe, calibrationStatsByTimeframe)
     : undefined;
-  const strategiesApplied = strategiesForPattern(pattern.pattern, pattern.direction, category, symbol);
   const tradePlan = buildTradePlan(currentPrice, pattern.support, pattern.resistance, pattern.direction, pattern.pattern, confidence, timeframe, category);
-  const technicals = buildTechnicalAnalysis(symbol, timeframe, candles, pattern.support, pattern.resistance);
-  const fundamentals = buildFundamentalAnalysis(category, symbol, pattern.direction);
   const deepDive = buildDeepDiveDimension(technicals, fundamentals, pattern, strategiesApplied);
 
   return {
@@ -819,11 +1043,25 @@ function buildSignal(
     calibratedConfidence: calibration?.calibratedConfidence,
     calibrationSampleSize: calibration?.calibrationSampleSize,
     calibrationBucket: calibration?.calibrationBucket,
+    candlestickPattern: pattern.candlestickPattern,
+    candlestickBias: pattern.candlestickBias,
+    candlestickImpactScore: pattern.candlestickImpactScore,
+    volumeRatio: pattern.volumeRatio,
+    volumeImpactScore: pattern.volumeImpactScore,
+    trendImpactScore: pattern.trendImpactScore,
+    historicalRecurrenceScore: pattern.historicalRecurrenceScore,
+    historicalRecurrenceSummary: pattern.historicalRecurrenceSummary,
+    sentimentFlowImpactScore: sentimentFlow.impactScore,
+    sentimentFlowSummary: sentimentFlow.summary,
+    sentimentFlowBreakdown: sentimentFlow.breakdown,
+    volumeConfirmation: pattern.volumeConfirmation,
+    isAtSupport: pattern.isAtSupport,
+    isAtResistance: pattern.isAtResistance,
     direction: pattern.direction,
     currentPrice: roundTo(currentPrice),
     lastOccurrenceAt,
     source,
-    strategySummary: strategySummary(pattern, pattern.direction, technicals, fundamentals),
+    strategySummary: strategySummary(pattern, pattern.direction, technicals, fundamentals, sentimentFlow),
     strategiesApplied,
     tradePlan,
     support: roundTo(pattern.support),
@@ -856,11 +1094,46 @@ function categoryName(category: MarketAssetCategory) {
   return "Oil";
 }
 
-export async function getMarketAgentsAnalysis(): Promise<MarketAgentsResponse> {
+function normalizeForexSymbolKey(symbol: string) {
+  return symbol.toUpperCase().replace(/[^A-Z]/g, "");
+}
+
+function resolveLiveSpotPriceFromMt4(symbol: string, quotesBySymbol: Map<string, number>) {
+  const normalized = normalizeForexSymbolKey(symbol);
+  const direct = quotesBySymbol.get(normalized);
+  if (typeof direct === "number" && Number.isFinite(direct) && direct > 0) {
+    return direct;
+  }
+
+  for (const [key, value] of quotesBySymbol.entries()) {
+    if (key.startsWith(normalized) || normalized.startsWith(key)) {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+async function buildMarketAgentsAnalysis(): Promise<MarketAgentsResponse> {
   const reports: MarketAgentReport[] = [];
   const sources = new Set<HistorySource>();
   const generatedAt = new Date().toISOString();
   const calibrationStatsByTimeframe = buildCalibrationStatsByTimeframe();
+  const mt4Snapshot = getLatestMt4Snapshot();
+  const mt4QuotesBySymbol = new Map<string, number>();
+
+  if (mt4Snapshot?.quotes?.length) {
+    for (const quote of mt4Snapshot.quotes) {
+      if (!Number.isFinite(quote.bid) || !Number.isFinite(quote.ask)) {
+        continue;
+      }
+
+      const mid = (quote.bid + quote.ask) / 2;
+      if (Number.isFinite(mid) && mid > 0) {
+        mt4QuotesBySymbol.set(normalizeForexSymbolKey(quote.symbol), mid);
+      }
+    }
+  }
 
   for (const config of AGENT_CONFIG) {
     const history = await getMarketHistory(config.symbols, ANALYSIS_TIMEFRAMES, 5);
@@ -868,7 +1141,9 @@ export async function getMarketAgentsAnalysis(): Promise<MarketAgentsResponse> {
     const agentSignals: MarketAgentTimeframeSignal[] = [];
 
     for (const symbol of config.symbols) {
-      const liveSpotPrice = config.category === "forex" ? await getLiveForexSpotPrice(symbol) : null;
+      const liveSpotPrice = config.category === "forex"
+        ? resolveLiveSpotPriceFromMt4(symbol, mt4QuotesBySymbol) ?? await getLiveForexSpotPrice(symbol)
+        : null;
       const symbolHistory = history.data[symbol] ?? {};
       const timeframeSignals = ANALYSIS_TIMEFRAMES
         .map((timeframe) => {
@@ -878,8 +1153,11 @@ export async function getMarketAgentsAnalysis(): Promise<MarketAgentsResponse> {
             return null;
           }
 
-          sources.add(frame.source);
-          return buildSignal(symbol, config.category, timeframe, pattern, frame.candles, frame.source, liveSpotPrice, calibrationStatsByTimeframe);
+          const signal = buildSignal(symbol, config.category, timeframe, pattern, frame.candles, frame.source, liveSpotPrice, calibrationStatsByTimeframe);
+          if (signal) {
+            sources.add(frame.source);
+          }
+          return signal;
         })
         .filter((signal): signal is MarketAgentTimeframeSignal => Boolean(signal));
 
@@ -955,6 +1233,28 @@ export async function getMarketAgentsAnalysis(): Promise<MarketAgentsResponse> {
     reason: "Three analysis agents built from live/derived price history with technical indicators, macro drivers, strategy plans, and graph placeholders.",
     generatedAt
   };
+}
+
+export async function getMarketAgentsAnalysis(): Promise<MarketAgentsResponse> {
+  const now = Date.now();
+  if (marketAgentsCache && (now - marketAgentsCache.cachedAt) < MARKET_AGENTS_CACHE_TTL_MS) {
+    return marketAgentsCache.value;
+  }
+
+  if (marketAgentsInFlight) {
+    return marketAgentsInFlight;
+  }
+
+  marketAgentsInFlight = buildMarketAgentsAnalysis()
+    .then((result) => {
+      marketAgentsCache = { value: result, cachedAt: Date.now() };
+      return result;
+    })
+    .finally(() => {
+      marketAgentsInFlight = null;
+    });
+
+  return marketAgentsInFlight;
 }
 
 function evaluateTradeStatusByLevels(direction: "up" | "down" | "neutral", stopLoss: number, takeProfit: number, currentPrice: number): ForexTradeMonitoringStatus {

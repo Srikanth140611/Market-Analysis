@@ -112,6 +112,46 @@ export type MarketHistorySource = "live" | "derived" | "fallback" | "mixed";
 
 export type MarketPatternKind = "trend" | "range" | "breakout" | "reversal" | "momentum" | "compression";
 
+export type CandlestickPattern =
+  | "none"
+  | "doji"
+  | "dragonfly-doji"
+  | "gravestone-doji"
+  | "hammer"
+  | "inverted-hammer"
+  | "hanging-man"
+  | "bullish-spinning-top"
+  | "bearish-spinning-top"
+  | "bullish-marubozu"
+  | "bullish-kikker"
+  | "bearish-kikker"
+  | "bullish-engulfing"
+  | "bearish-engulfing"
+  | "piercing-line"
+  | "dark-cloud-cover"
+  | "tweezer-bottom"
+  | "tweezer-top"
+  | "bullish-harami"
+  | "bearish-harami"
+  | "morning-star"
+  | "bullish-abondened-baby"
+  | "bearish-abondened-baby"
+  | "three-white-soldiers"
+  | "three-black-crows"
+  | "three-line-strike"
+  | "cup-and-handle"
+  | "double-top"
+  | "double-bottom"
+  | "doble-bottom"
+  | "wedge"
+  | "flag"
+  | "rising-window"
+  | "falling-window"
+  | "three-inside-up"
+  | "three-inside-down"
+  | "three-outside-up"
+  | "three-outside-down";
+
 export type MarketPatternSignal = {
   symbol: string;
   name: string;
@@ -125,6 +165,17 @@ export type MarketPatternSignal = {
   latestClose: number;
   sampleSize: number;
   source: MarketHistorySource;
+  candlestickPattern?: CandlestickPattern;
+  candlestickBias?: "up" | "down" | "neutral";
+  candlestickImpactScore?: number;
+  volumeRatio?: number | null;
+  volumeImpactScore?: number;
+  trendImpactScore?: number;
+  historicalRecurrenceScore?: number;
+  historicalRecurrenceSummary?: string;
+  volumeConfirmation?: "strong" | "weak" | "neutral" | "unavailable";
+  isAtSupport?: boolean;
+  isAtResistance?: boolean;
   note: string;
 };
 
@@ -196,6 +247,27 @@ export type MarketAgentTimeframeSignal = {
   calibratedConfidence?: number;
   calibrationSampleSize?: number;
   calibrationBucket?: string;
+  candlestickPattern?: CandlestickPattern;
+  candlestickBias?: "up" | "down" | "neutral";
+  candlestickImpactScore?: number;
+  volumeRatio?: number | null;
+  volumeImpactScore?: number;
+  trendImpactScore?: number;
+  sentimentFlowImpactScore?: number;
+  sentimentFlowSummary?: string;
+  sentimentFlowBreakdown?: {
+    cotReport: number;
+    interestRateDifferential: number;
+    centralBankCommentary: number;
+    riskOnRiskOff: number;
+    optionsMarket: number;
+    retailPositioning: number;
+    economicCalendar: number;
+    source: "proxy";
+  };
+  volumeConfirmation?: "strong" | "weak" | "neutral" | "unavailable";
+  isAtSupport?: boolean;
+  isAtResistance?: boolean;
   direction: "up" | "down" | "neutral";
   currentPrice: number;
   lastOccurrenceAt: string;
@@ -272,6 +344,9 @@ export type ForexTradeMonitoringReport = {
   activeTrades: number;
   resolvedTrades: number;
   winRatePercent: number;
+  monitoringDayKey: string;
+  monitoringTimeZone: string;
+  confidenceThreshold: number;
   generatedAt: string;
   items: ForexTradeMonitoringItem[];
 };

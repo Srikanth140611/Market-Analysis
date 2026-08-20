@@ -7,6 +7,7 @@ input string AccountId = "demo-account";
 input string TerminalId = "mt5-terminal-1";
 input string ServerName = "";
 input string SymbolsCsv = "AUDCHF,AUDJPY,AUDNZD,AUDUSD,CADJPY,EURAUD,EURCAD,EURGBP,EURJPY,EURNZD,EURUSD,GBPAUD,GBPNZD,GBPUSD,NZDJPY,USDCAD,USDCHF,USDJPY";
+input int HistoryBars = 120;
 input int TimerSeconds = 1;
 input int SnapshotCooldownSeconds = 5;
 input int SenderLeaseSeconds = 30;
@@ -251,6 +252,104 @@ string BuildQuotesJson(string symbolsCsv)
    return json;
 }
 
+string ResolveHistorySymbol(string requested)
+{
+   string resolved = Trim(requested);
+   if (SymbolSelect(resolved, true))
+   {
+      return resolved;
+   }
+
+   int total = SymbolsTotal(true);
+   string requestedUpper = StringToUpper(resolved);
+   for (int index = 0; index < total; index++)
+   {
+      string candidate = SymbolName(index, true);
+      string candidateUpper = StringToUpper(candidate);
+      if (candidateUpper == requestedUpper || StringFind(candidateUpper, requestedUpper) == 0)
+      {
+         if (SymbolSelect(candidate, true))
+         {
+            return candidate;
+         }
+      }
+   }
+
+   return "";
+}
+
+string BuildHistoryFrameJson(string symbol, ENUM_TIMEFRAMES timeframe)
+{
+   string resolved = ResolveHistorySymbol(symbol);
+   if (resolved == "")
+   {
+      return "[]";
+   }
+
+   MqlRates rates[];
+   int copied = CopyRates(resolved, timeframe, 1, MathMax(30, HistoryBars), rates);
+   if (copied <= 0)
+   {
+      return "[]";
+   }
+
+   string json = "[";
+   for (int index = 0; index < copied; index++)
+   {
+      if (index > 0)
+      {
+         json += ",";
+      }
+
+      json += StringFormat(
+         "{\"t\":%I64d,\"o\":%s,\"h\":%s,\"l\":%s,\"c\":%s,\"v\":%s}",
+         (long)rates[index].time * 1000,
+         QuoteValue(rates[index].open, 8),
+         QuoteValue(rates[index].high, 8),
+         QuoteValue(rates[index].low, 8),
+         QuoteValue(rates[index].close, 8),
+         QuoteValue((double)rates[index].tick_volume, 0)
+      );
+   }
+
+   json += "]";
+   return json;
+}
+
+string BuildHistoryJson(string symbolsCsv)
+{
+   string parts[];
+   int count = StringSplit(symbolsCsv, ',', parts);
+   string json = "{";
+   bool hasSymbol = false;
+
+   for (int index = 0; index < count; index++)
+   {
+      string symbol = Trim(parts[index]);
+      if (symbol == "")
+      {
+         continue;
+      }
+
+      if (hasSymbol)
+      {
+         json += ",";
+      }
+      hasSymbol = true;
+      json += StringFormat(
+         "\"%s\":{\"1hour\":%s,\"4hour\":%s,\"1Day\":%s,\"1Week\":%s}",
+         JsonEscape(symbol),
+         BuildHistoryFrameJson(symbol, PERIOD_H1),
+         BuildHistoryFrameJson(symbol, PERIOD_H4),
+         BuildHistoryFrameJson(symbol, PERIOD_D1),
+         BuildHistoryFrameJson(symbol, PERIOD_W1)
+      );
+   }
+
+   json += "}";
+   return json;
+}
+
 string BuildPayload()
 {
    gHeartbeat++;
@@ -263,7 +362,8 @@ string BuildPayload()
    payload += StringFormat("\"equity\":%s,", DoubleToString(SafeNumber(AccountInfoDouble(ACCOUNT_EQUITY)), 2));
    payload += StringFormat("\"margin\":%s,", DoubleToString(SafeNumber(AccountInfoDouble(ACCOUNT_MARGIN)), 2));
    payload += StringFormat("\"freeMargin\":%s,", DoubleToString(SafeNumber(AccountInfoDouble(ACCOUNT_MARGIN_FREE)), 2));
-   payload += StringFormat("\"quotes\":%s", BuildQuotesJson(SymbolsCsv));
+   payload += StringFormat("\"quotes\":%s,", BuildQuotesJson(SymbolsCsv));
+   payload += StringFormat("\"history\":%s", BuildHistoryJson(SymbolsCsv));
    payload += "}";
 
    return payload;

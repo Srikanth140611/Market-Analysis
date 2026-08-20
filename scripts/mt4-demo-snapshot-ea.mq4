@@ -6,6 +6,7 @@ input string AccountId = "demo-account";
 input string TerminalId = "mt4-terminal-1";
 input string ServerName = "";
 input string SymbolsCsv = "EURUSD,GBPUSD,USDJPY";
+input int HistoryBars = 120;
 input int TimerSeconds = 1;
 
 int gHeartbeat = 0;
@@ -74,6 +75,84 @@ string BuildQuotesJson(string symbolsCsv)
    }
 
    json += "]";
+   return json;
+}
+
+string BuildHistoryFrameJson(string symbol, int timeframe)
+{
+   int available = iBars(symbol, timeframe);
+   int count = MathMin(available - 1, MathMax(30, HistoryBars));
+   int digits = (int)MarketInfo(symbol, MODE_DIGITS);
+   if (count <= 0)
+   {
+      return "[]";
+   }
+
+   string json = "[";
+   int written = 0;
+   for (int shift = count; shift >= 1; shift--)
+   {
+      datetime timestamp = iTime(symbol, timeframe, shift);
+      double open = iOpen(symbol, timeframe, shift);
+      double high = iHigh(symbol, timeframe, shift);
+      double low = iLow(symbol, timeframe, shift);
+      double close = iClose(symbol, timeframe, shift);
+      if (timestamp <= 0 || open <= 0 || high <= 0 || low <= 0 || close <= 0)
+      {
+         continue;
+      }
+
+      if (written > 0)
+      {
+         json += ",";
+      }
+      written++;
+      json += StringFormat(
+         "{\"t\":%I64d,\"o\":%s,\"h\":%s,\"l\":%s,\"c\":%s,\"v\":%s}",
+         (long)timestamp * 1000,
+         DoubleToString(open, digits),
+         DoubleToString(high, digits),
+         DoubleToString(low, digits),
+         DoubleToString(close, digits),
+         DoubleToString(iVolume(symbol, timeframe, shift), 0)
+      );
+   }
+
+   json += "]";
+   return json;
+}
+
+string BuildHistoryJson(string symbolsCsv)
+{
+   string parts[];
+   int count = StringSplit(symbolsCsv, ',', parts);
+   string json = "{";
+   bool hasSymbol = false;
+
+   for (int index = 0; index < count; index++)
+   {
+      string symbol = Trim(parts[index]);
+      if (symbol == "")
+      {
+         continue;
+      }
+
+      if (hasSymbol)
+      {
+         json += ",";
+      }
+      hasSymbol = true;
+      json += StringFormat(
+         "\"%s\":{\"1hour\":%s,\"4hour\":%s,\"1Day\":%s,\"1Week\":%s}",
+         JsonEscape(symbol),
+         BuildHistoryFrameJson(symbol, PERIOD_H1),
+         BuildHistoryFrameJson(symbol, PERIOD_H4),
+         BuildHistoryFrameJson(symbol, PERIOD_D1),
+         BuildHistoryFrameJson(symbol, PERIOD_W1)
+      );
+   }
+
+   json += "}";
    return json;
 }
 
@@ -213,7 +292,8 @@ string BuildPayload()
    payload += StringFormat("\"freeMargin\":%s,", DoubleToString(AccountFreeMargin(), 2));
    payload += StringFormat("\"positions\":%s,", BuildPositionsJson());
    payload += StringFormat("\"pendingOrders\":%s,", BuildPendingOrdersJson());
-   payload += StringFormat("\"quotes\":%s", BuildQuotesJson(SymbolsCsv));
+   payload += StringFormat("\"quotes\":%s,", BuildQuotesJson(SymbolsCsv));
+   payload += StringFormat("\"history\":%s", BuildHistoryJson(SymbolsCsv));
    payload += "}";
 
    return payload;

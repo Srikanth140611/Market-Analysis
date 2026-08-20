@@ -4,6 +4,7 @@ const RSS_FEEDS = [
 ];
 
 const STRICT_LIVE_MODE = true;
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || "";
 const MT4_SNAPSHOT_API_KEY = process.env.MT4_SNAPSHOT_API_KEY || "";
 const MT4_SNAPSHOT_TABLE = process.env.MT4_SNAPSHOT_TABLE || "";
 const MT4_SNAPSHOT_PK_NAME = process.env.MT4_SNAPSHOT_PK_NAME || "snapshotKey";
@@ -112,7 +113,8 @@ function aggregateCandles(candles, bucket) {
       o: chunk[0].o,
       h: Math.max(...chunk.map((candle) => candle.h)),
       l: Math.min(...chunk.map((candle) => candle.l)),
-      c: chunk[chunk.length - 1].c
+      c: chunk[chunk.length - 1].c,
+      v: chunk.reduce((sum, candle) => sum + (Number(candle.v) || 0), 0)
     });
   }
 
@@ -136,7 +138,8 @@ function compressCandles(candles, targetCount) {
       o: chunk[0].o,
       h: Math.max(...chunk.map((candle) => candle.h)),
       l: Math.min(...chunk.map((candle) => candle.l)),
-      c: chunk[chunk.length - 1].c
+      c: chunk[chunk.length - 1].c,
+      v: chunk.reduce((sum, candle) => sum + (Number(candle.v) || 0), 0)
     });
   }
 
@@ -183,6 +186,7 @@ function toCandleSeries(payload) {
   const highs = isFiniteNumberArray(payload.high) ? payload.high : [];
   const lows = isFiniteNumberArray(payload.low) ? payload.low : [];
   const closes = isFiniteNumberArray(payload.close) ? payload.close : [];
+  const volumes = Array.isArray(payload.volume) ? payload.volume : [];
   const length = Math.min(timestamps.length, closes.length);
 
   const candles = [];
@@ -202,13 +206,14 @@ function toCandleSeries(payload) {
     }
 
     candles.push({ t: timestamp, o: open, h: high, l: low, c: close });
+    candles[candles.length - 1].v = Number.isFinite(volumes[index]) ? Number(volumes[index]) : 0;
   }
 
   return candles;
 }
 
-async function fetchYahooHistory(symbol) {
-  const response = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5y`, {
+async function fetchYahooHistory(symbol, interval = "1d", range = "5y") {
+  const response = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`, {
     headers: {
       "User-Agent": "Mozilla/5.0",
       Accept: "application/json,text/plain,*/*",
@@ -231,7 +236,8 @@ async function fetchYahooHistory(symbol) {
     open: result.indicators?.quote?.[0]?.open,
     high: result.indicators?.quote?.[0]?.high,
     low: result.indicators?.quote?.[0]?.low,
-    close: result.indicators?.quote?.[0]?.close
+    close: result.indicators?.quote?.[0]?.close,
+    volume: result.indicators?.quote?.[0]?.volume
   });
 }
 
@@ -265,6 +271,65 @@ async function fetchYahooForexSpotPrice(symbol) {
   return null;
 }
 
+const FINNHUB_FOREX_SYMBOLS = {
+  "AUD/USD": "OANDA:AUD_USD",
+  "USD/JPY": "OANDA:USD_JPY",
+  "EUR/USD": "OANDA:EUR_USD",
+  "GBP/USD": "OANDA:GBP_USD",
+  "AUD/JPY": "OANDA:AUD_JPY",
+  "EUR/AUD": "OANDA:EUR_AUD",
+  "GBP/AUD": "OANDA:GBP_AUD",
+  "AUD/NZD": "OANDA:AUD_NZD",
+  "EUR/NZD": "OANDA:EUR_NZD",
+  "EUR/GBP": "OANDA:EUR_GBP",
+  "CAD/JPY": "OANDA:CAD_JPY",
+  "USD/CAD": "OANDA:USD_CAD",
+  "USD/CHF": "OANDA:USD_CHF",
+  "GBP/NZD": "OANDA:GBP_NZD",
+  "NZD/JPY": "OANDA:NZD_JPY",
+  "AUD/CHF": "OANDA:AUD_CHF",
+  "EUR/CAD": "OANDA:EUR_CAD",
+  "EUR/JPY": "OANDA:EUR_JPY"
+};
+
+async function fetchFinnhubCandles(symbol, resolution, fromSeconds, toSeconds) {
+  if (!FINNHUB_API_KEY || !FINNHUB_FOREX_SYMBOLS[symbol]) {
+    return [];
+  }
+
+  const url = new URL("https://finnhub.io/api/v1/forex/candle");
+  url.searchParams.set("symbol", FINNHUB_FOREX_SYMBOLS[symbol]);
+  url.searchParams.set("resolution", resolution);
+  url.searchParams.set("from", String(fromSeconds));
+  url.searchParams.set("to", String(toSeconds));
+  url.searchParams.set("token", FINNHUB_API_KEY);
+
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      return [];
+    }
+
+    const payload = await response.json();
+    if (payload?.s !== "ok" || !Array.isArray(payload.t) || !Array.isArray(payload.o) || !Array.isArray(payload.h) || !Array.isArray(payload.l) || !Array.isArray(payload.c)) {
+      return [];
+    }
+
+    const volume = Array.isArray(payload.v) ? payload.v : [];
+    const length = Math.min(payload.t.length, payload.o.length, payload.h.length, payload.l.length, payload.c.length);
+    return Array.from({ length }, (_, index) => ({
+      t: Number(payload.t[index]) * 1000,
+      o: Number(payload.o[index]),
+      h: Number(payload.h[index]),
+      l: Number(payload.l[index]),
+      c: Number(payload.c[index]),
+      v: Number(volume[index]) || 0
+    })).filter((candle) => Object.values(candle).slice(0, 5).every((value) => Number.isFinite(value)));
+  } catch {
+    return [];
+  }
+}
+
 function sma(values, period) {
   if (values.length === 0) {
     return 0;
@@ -272,6 +337,20 @@ function sma(values, period) {
 
   const slice = values.slice(-Math.min(period, values.length));
   return slice.reduce((sum, value) => sum + value, 0) / slice.length;
+}
+
+function ema(values, period) {
+  if (values.length === 0) {
+    return 0;
+  }
+
+  const smoothing = 2 / (period + 1);
+  let current = values[0];
+  for (let index = 1; index < values.length; index += 1) {
+    current = (values[index] * smoothing) + (current * (1 - smoothing));
+  }
+
+  return current;
 }
 
 function rsi(values, period) {
@@ -298,6 +377,320 @@ function rsi(values, period) {
   return 100 - 100 / (1 + rs);
 }
 
+function closeTo(left, right, tolerancePct = 0.12) {
+  const base = Math.max(Math.abs(left), Math.abs(right), 0.0000001);
+  return (Math.abs(left - right) / base) * 100 <= tolerancePct;
+}
+
+function candleStats(candle) {
+  const range = Math.max(candle.h - candle.l, 0.0000001);
+  const body = Math.abs(candle.c - candle.o);
+  const upperWick = candle.h - Math.max(candle.o, candle.c);
+  const lowerWick = Math.min(candle.o, candle.c) - candle.l;
+  const mid = (candle.o + candle.c) / 2;
+
+  return {
+    range,
+    body,
+    bodyPct: body / range,
+    upperWickPct: upperWick / range,
+    lowerWickPct: lowerWick / range,
+    bullish: candle.c > candle.o,
+    bearish: candle.c < candle.o,
+    mid,
+    marubozuBullish: candle.c > candle.o && body / range >= 0.85 && upperWick / range <= 0.08 && lowerWick / range <= 0.08,
+    marubozuBearish: candle.o > candle.c && body / range >= 0.85 && upperWick / range <= 0.08 && lowerWick / range <= 0.08,
+    doji: body / range <= 0.12,
+    spinningTop: body / range <= 0.3 && upperWick / range >= 0.25 && lowerWick / range >= 0.25
+  };
+}
+
+function highest(values) {
+  return values.reduce((max, value) => Math.max(max, value), Number.NEGATIVE_INFINITY);
+}
+
+function lowest(values) {
+  return values.reduce((min, value) => Math.min(min, value), Number.POSITIVE_INFINITY);
+}
+
+function matchesCandlestickContext(pattern, slope, context) {
+  if (!context || pattern === "none") {
+    return true;
+  }
+
+  const supportReversalPatterns = [
+    "dragonfly-doji", "hammer", "inverted-hammer", "bullish-engulfing", "piercing-line",
+    "tweezer-bottom", "bullish-harami", "morning-star", "three-inside-up", "three-outside-up",
+    "bullish-abondened-baby", "double-bottom", "doble-bottom"
+  ];
+  const resistanceReversalPatterns = [
+    "gravestone-doji", "hanging-man", "bearish-engulfing", "dark-cloud-cover", "tweezer-top",
+    "bearish-harami", "three-inside-down", "three-outside-down", "bearish-abondened-baby", "double-top"
+  ];
+
+  if (supportReversalPatterns.includes(pattern)) {
+    return context.isAtSupport && slope <= 0;
+  }
+
+  if (resistanceReversalPatterns.includes(pattern)) {
+    return context.isAtResistance && slope >= 0;
+  }
+
+  return true;
+}
+
+function detectCandlestickPattern(candles, slope, context) {
+  const latest = candles[candles.length - 1];
+  const previous = candles[candles.length - 2];
+  const third = candles[candles.length - 3];
+  const fourth = candles[candles.length - 4];
+
+  if (!latest) {
+    return {
+      pattern: "none",
+      bias: "neutral",
+      strength: 0,
+      note: "No high-conviction candlestick trigger on the latest bar."
+    };
+  }
+
+  const s1 = candleStats(latest);
+  const s2 = previous ? candleStats(previous) : null;
+  const s3 = third ? candleStats(third) : null;
+  const s4 = fourth ? candleStats(fourth) : null;
+  const candidates = [];
+
+  const push = (candidate, when = true) => {
+    if (when && matchesCandlestickContext(candidate.pattern, slope, context)) {
+      candidates.push(candidate);
+    }
+  };
+
+  const isDragonfly = s1.doji && s1.lowerWickPct >= 0.6 && s1.upperWickPct <= 0.12;
+  const isGravestone = s1.doji && s1.upperWickPct >= 0.6 && s1.lowerWickPct <= 0.12;
+  const isHammer = s1.bodyPct <= 0.35 && s1.lowerWickPct >= 0.55 && s1.upperWickPct <= 0.22;
+  const isInvertedHammer = s1.bodyPct <= 0.35 && s1.upperWickPct >= 0.55 && s1.lowerWickPct <= 0.22;
+  const isHangingMan = isHammer && slope > 0;
+
+  push({ pattern: "dragonfly-doji", bias: "up", strength: 4, note: "Dragonfly doji rejects lower prices." }, isDragonfly);
+  push({ pattern: "gravestone-doji", bias: "down", strength: 4, note: "Gravestone doji rejects higher prices." }, isGravestone);
+  push({ pattern: "doji", bias: "neutral", strength: 2, note: "Doji reflects indecision." }, s1.doji && !isDragonfly && !isGravestone);
+  push({ pattern: "hammer", bias: "up", strength: 4, note: "Hammer suggests bullish reversal pressure." }, isHammer && !isHangingMan);
+  push({ pattern: "inverted-hammer", bias: "up", strength: 3, note: "Inverted hammer suggests potential upside reversal." }, isInvertedHammer && slope <= 0);
+  push({ pattern: "hanging-man", bias: "down", strength: 4, note: "Hanging man warns of bearish reversal risk." }, isHangingMan);
+  push({ pattern: "bullish-spinning-top", bias: "up", strength: 2, note: "Bullish spinning top indicates weak upside edge." }, s1.spinningTop && s1.bullish);
+  push({ pattern: "bearish-spinning-top", bias: "down", strength: 2, note: "Bearish spinning top indicates weak downside edge." }, s1.spinningTop && s1.bearish);
+  push({ pattern: "bullish-marubozu", bias: "up", strength: 4, note: "Bullish marubozu confirms strong buyer control." }, s1.marubozuBullish);
+
+  if (s2) {
+    const bullishEngulfing = s2.bearish && s1.bullish && latest.o <= previous.c && latest.c >= previous.o;
+    const bearishEngulfing = s2.bullish && s1.bearish && latest.o >= previous.c && latest.c <= previous.o;
+    const piercingLine = s2.bearish && s1.bullish && latest.c > (previous.o + previous.c) / 2 && latest.c < previous.o;
+    const darkCloudCover = s2.bullish && s1.bearish && latest.c < (previous.o + previous.c) / 2 && latest.c > previous.o;
+    const tweezerBottom = closeTo(latest.l, previous.l, 0.15) && s2.bearish && s1.bullish;
+    const tweezerTop = closeTo(latest.h, previous.h, 0.15) && s2.bullish && s1.bearish;
+    const bullishHarami = s2.bearish && s1.bullish && latest.o >= previous.c && latest.c <= previous.o;
+    const bearishHarami = s2.bullish && s1.bearish && latest.o <= previous.c && latest.c >= previous.o;
+    const bullishKikker = s2.marubozuBearish && s1.marubozuBullish && latest.o > previous.h;
+    const bearishKikker = s2.marubozuBullish && s1.marubozuBearish && latest.o < previous.l;
+    const risingWindow = previous.h < latest.l;
+    const fallingWindow = previous.l > latest.h;
+
+    push({ pattern: "bullish-engulfing", bias: "up", strength: 5, note: "Bullish engulfing shows strong reversal intent." }, bullishEngulfing);
+    push({ pattern: "bearish-engulfing", bias: "down", strength: 5, note: "Bearish engulfing shows strong reversal intent." }, bearishEngulfing);
+    push({ pattern: "piercing-line", bias: "up", strength: 4, note: "Piercing line confirms buyers reclaiming ground." }, piercingLine);
+    push({ pattern: "dark-cloud-cover", bias: "down", strength: 4, note: "Dark cloud cover signals bearish fade." }, darkCloudCover);
+    push({ pattern: "tweezer-bottom", bias: "up", strength: 4, note: "Tweezer bottom marks support rejection." }, tweezerBottom);
+    push({ pattern: "tweezer-top", bias: "down", strength: 4, note: "Tweezer top marks resistance rejection." }, tweezerTop);
+    push({ pattern: "bullish-harami", bias: "up", strength: 3, note: "Bullish harami indicates base-building reversal." }, bullishHarami);
+    push({ pattern: "bearish-harami", bias: "down", strength: 3, note: "Bearish harami indicates topping risk." }, bearishHarami);
+    push({ pattern: "bullish-kikker", bias: "up", strength: 5, note: "Bullish kikker reflects abrupt sentiment flip." }, bullishKikker);
+    push({ pattern: "bearish-kikker", bias: "down", strength: 5, note: "Bearish kikker reflects abrupt sentiment flip." }, bearishKikker);
+    push({ pattern: "rising-window", bias: "up", strength: 4, note: "Rising window gap supports continuation." }, risingWindow);
+    push({ pattern: "falling-window", bias: "down", strength: 4, note: "Falling window gap supports continuation." }, fallingWindow);
+  }
+
+  if (s2 && s3) {
+    const morningStar = s3.bearish && s2.bodyPct <= 0.25 && s1.bullish && latest.c > s3.mid;
+    const threeWhiteSoldiers = s3.bullish && s2.bullish && s1.bullish && latest.c > previous.c && previous.c > third.c;
+    const threeBlackCrows = s3.bearish
+      && s2.bearish
+      && s1.bearish
+      && s3.bodyPct >= 0.55
+      && s2.bodyPct >= 0.55
+      && s1.bodyPct >= 0.55
+      && s3.upperWickPct <= 0.2
+      && s2.upperWickPct <= 0.2
+      && s1.upperWickPct <= 0.2
+      && s4 !== null
+      && s4.bullish
+      && fourth.c >= third.o
+      && previous.o <= third.o
+      && previous.o >= third.c
+      && latest.o <= previous.o
+      && latest.o >= previous.c
+      && latest.c < previous.c
+      && previous.c < third.c
+      && latest.c < latest.o
+      && previous.c < previous.o
+      && third.c < third.o;
+    const threeInsideUp = s3.bearish && s2.bullish && previous.o <= third.o && previous.c >= third.c && s1.bullish && latest.c > third.o;
+    const threeInsideDown = s3.bullish && s2.bearish && previous.o >= third.o && previous.c <= third.c && s1.bearish && latest.c < third.o;
+    const threeOutsideUp = s3.bearish && s2.bullish && previous.o <= third.c && previous.c >= third.o && s1.bullish && latest.c > previous.c;
+    const threeOutsideDown = s3.bullish && s2.bearish && previous.o >= third.c && previous.c <= third.o && s1.bearish && latest.c < previous.c;
+    const bullishAbondenedBaby = s3.bearish && s2.doji && s1.bullish && previous.h < third.l && latest.l > previous.h;
+    const bearishAbondenedBaby = s3.bullish && s2.doji && s1.bearish && previous.l > third.h && latest.h < previous.l;
+
+    push({ pattern: "morning-star", bias: "up", strength: 5, note: "Morning star supports bullish reversal." }, morningStar);
+    push({ pattern: "three-white-soldiers", bias: "up", strength: 5, note: "Three white soldiers confirm sustained buying." }, threeWhiteSoldiers);
+    push({ pattern: "three-black-crows", bias: "down", strength: 5, note: "Three black crows confirm sustained selling." }, threeBlackCrows);
+    push({ pattern: "three-inside-up", bias: "up", strength: 4, note: "Three inside up confirms bullish reversal." }, threeInsideUp);
+    push({ pattern: "three-inside-down", bias: "down", strength: 4, note: "Three inside down confirms bearish reversal." }, threeInsideDown);
+    push({ pattern: "three-outside-up", bias: "up", strength: 4, note: "Three outside up confirms upside momentum." }, threeOutsideUp);
+    push({ pattern: "three-outside-down", bias: "down", strength: 4, note: "Three outside down confirms downside momentum." }, threeOutsideDown);
+    push({ pattern: "bullish-abondened-baby", bias: "up", strength: 5, note: "Bullish abondened baby signals sharp reversal." }, bullishAbondenedBaby);
+    push({ pattern: "bearish-abondened-baby", bias: "down", strength: 5, note: "Bearish abondened baby signals sharp reversal." }, bearishAbondenedBaby);
+  }
+
+  if (s2 && s3 && s4) {
+    const threeLineStrikeBullish = s4.bearish && s3.bearish && s2.bearish && s1.bullish && latest.c > fourth.o;
+    const threeLineStrikeBearish = s4.bullish && s3.bullish && s2.bullish && s1.bearish && latest.c < fourth.o;
+    push({ pattern: "three-line-strike", bias: "up", strength: 5, note: "Three line strike points to bullish exhaustion reversal." }, threeLineStrikeBullish);
+    push({ pattern: "three-line-strike", bias: "down", strength: 5, note: "Three line strike points to bearish exhaustion reversal." }, threeLineStrikeBearish);
+  }
+
+  if (candles.length >= 12) {
+    const recent = candles.slice(-12);
+    const highs = recent.map((item) => item.h);
+    const lows = recent.map((item) => item.l);
+    const closes = recent.map((item) => item.c);
+    const firstHalf = closes.slice(0, 6);
+    const secondHalf = closes.slice(6);
+    const firstMove = firstHalf[firstHalf.length - 1] - firstHalf[0];
+    const secondRange = highest(secondHalf) - lowest(secondHalf);
+    const firstRange = highest(firstHalf) - lowest(firstHalf);
+    const flagBullish = firstMove > 0 && secondRange < firstRange * 0.45;
+    const flagBearish = firstMove < 0 && secondRange < firstRange * 0.45;
+
+    push({ pattern: "flag", bias: "up", strength: 3, note: "Bullish flag continuation structure detected." }, flagBullish);
+    push({ pattern: "flag", bias: "down", strength: 3, note: "Bearish flag continuation structure detected." }, flagBearish);
+
+    const highsFirst = highs.slice(0, 6);
+    const highsSecond = highs.slice(6);
+    const lowsFirst = lows.slice(0, 6);
+    const lowsSecond = lows.slice(6);
+    const wedge = (highest(highsSecond) < highest(highsFirst)) && (lowest(lowsSecond) > lowest(lowsFirst));
+    const wedgeBias = slope >= 0 ? "down" : "up";
+    push({ pattern: "wedge", bias: wedgeBias, strength: 3, note: "Wedge compression suggests breakout risk opposite mature trend." }, wedge);
+  }
+
+  if (candles.length >= 20) {
+    const recent = candles.slice(-20);
+    const highs = recent.map((item) => item.h);
+    const lows = recent.map((item) => item.l);
+    const maxHigh = highest(highs);
+    const minLow = lowest(lows);
+    const lastHigh = highs[highs.length - 1];
+    const midHigh = highs[Math.floor(highs.length / 2)];
+    const lastLow = lows[lows.length - 1];
+    const midLow = lows[Math.floor(lows.length / 2)];
+
+    push(
+      { pattern: "double-top", bias: "down", strength: 4, note: "Double top implies resistance has held twice." },
+      closeTo(lastHigh, maxHigh, 0.2) && closeTo(midHigh, maxHigh, 0.2)
+    );
+    push(
+      { pattern: "double-bottom", bias: "up", strength: 4, note: "Double bottom implies support has held twice." },
+      closeTo(lastLow, minLow, 0.2) && closeTo(midLow, minLow, 0.2)
+    );
+    push(
+      { pattern: "doble-bottom", bias: "up", strength: 4, note: "Doble bottom implies support has held twice." },
+      closeTo(lastLow, minLow, 0.2) && closeTo(midLow, minLow, 0.2)
+    );
+  }
+
+  if (candles.length >= 30) {
+    const recent = candles.slice(-30);
+    const closes = recent.map((item) => item.c);
+    const left = closes.slice(0, 10);
+    const middle = closes.slice(10, 22);
+    const right = closes.slice(22, 27);
+    const handle = closes.slice(27);
+    const leftPeak = highest(left);
+    const midLow = lowest(middle);
+    const rightPeak = highest(right);
+    const handleLow = lowest(handle);
+    const cup = midLow < leftPeak * 0.98 && closeTo(leftPeak, rightPeak, 0.7);
+    const validHandle = handleLow >= rightPeak * 0.97;
+    push({ pattern: "cup-and-handle", bias: "up", strength: 4, note: "Cup and handle continuation structure detected." }, cup && validHandle);
+  }
+
+  if (candidates.length === 0) {
+    return {
+      pattern: "none",
+      bias: "neutral",
+      strength: 0,
+      note: "No high-conviction candlestick trigger on the latest bar."
+    };
+  }
+
+  candidates.sort((left, right) => {
+    const leftRank = Math.abs(left.strength) + (left.bias === "neutral" ? 0 : 0.25);
+    const rightRank = Math.abs(right.strength) + (right.bias === "neutral" ? 0 : 0.25);
+    return rightRank - leftRank;
+  });
+
+  return candidates[0];
+}
+
+function candlestickImpactAtLevels(detection, baseDirection, isAtSupport, isAtResistance) {
+  if (detection.pattern === "none") {
+    return { score: 0, note: "Candlestick impact neutral." };
+  }
+
+  let score = 0;
+  if (detection.bias === "neutral") {
+    score = (isAtSupport || isAtResistance) ? -2 : 0;
+    return {
+      score,
+      note: score < 0
+        ? "Doji near key level reduces conviction until a breakout or rejection confirms."
+        : detection.note
+    };
+  }
+
+  if (baseDirection === "neutral") {
+    score += detection.strength;
+  } else if (detection.bias === baseDirection) {
+    score += detection.strength;
+  } else {
+    score -= Math.round(detection.strength * 1.6);
+  }
+
+  if (detection.bias === "up") {
+    if (isAtSupport) {
+      score += 3;
+    }
+    if (isAtResistance) {
+      score -= 3;
+    }
+  }
+
+  if (detection.bias === "down") {
+    if (isAtResistance) {
+      score += 3;
+    }
+    if (isAtSupport) {
+      score -= 3;
+    }
+  }
+
+  return {
+    score,
+    note: `${detection.note} Support/Resistance context impact: ${score >= 0 ? "+" : ""}${score}.`
+  };
+}
+
 function classifyPattern(meta, timeframe, candles, source) {
   const recentCandles = candles.slice(-50);
   const recentCloses = recentCandles.map((candle) => candle.c);
@@ -316,6 +709,15 @@ function classifyPattern(meta, timeframe, candles, source) {
       latestClose: 0,
       sampleSize: 0,
       source,
+      candlestickPattern: "none",
+      candlestickBias: "neutral",
+      candlestickImpactScore: 0,
+      volumeRatio: null,
+      volumeImpactScore: 0,
+      trendImpactScore: 0,
+      volumeConfirmation: "unavailable",
+      isAtSupport: false,
+      isAtResistance: false,
       note: `No history available for ${meta.symbol} on ${timeframeLabel(timeframe)}`
     };
   }
@@ -340,11 +742,232 @@ function classifyPattern(meta, timeframe, candles, source) {
 
   const nearResistance = latest.c >= resistance * 0.985;
   const nearSupport = latest.c <= support * 1.015;
+  const atSupport = latest.c <= support * 1.012;
+  const atResistance = latest.c >= resistance * 0.988;
   const trendUp = latest.c >= ma20 && ma20 >= ma50 && slope > 0;
   const trendDown = latest.c <= ma20 && ma20 <= ma50 && slope < 0;
   const compression = avgRangePercent < 1.2 && rangePercent < 6;
   const reversalUp = rsi14 <= 35 && slope > 0;
   const reversalDown = rsi14 >= 65 && slope < 0;
+
+  function trendStructureImpact() {
+    if (recentCandles.length < 12 || recentCloses.length < 12) {
+      return {
+        score: 0,
+        note: "Trend structure confirmation unavailable; confidence kept unchanged."
+      };
+    }
+
+    const latestClose = recentCloses[recentCloses.length - 1];
+    const ema20 = ema(recentCloses, 20);
+    const ema50 = ema(recentCloses, 50);
+    const ema200 = ema(recentCloses, 200);
+    const sma200 = sma(recentCloses, 200);
+
+    const structureWindow = Math.min(20, recentCandles.length);
+    const split = Math.floor(structureWindow / 2);
+    const earlier = recentCandles.slice(-structureWindow, -split);
+    const recent = recentCandles.slice(-split);
+    if (earlier.length < 4 || recent.length < 4) {
+      return {
+        score: 0,
+        note: "Trend structure confirmation unavailable; confidence kept unchanged."
+      };
+    }
+
+    const earlierHigh = Math.max(...earlier.map((candle) => candle.h));
+    const earlierLow = Math.min(...earlier.map((candle) => candle.l));
+    const recentHigh = Math.max(...recent.map((candle) => candle.h));
+    const recentLow = Math.min(...recent.map((candle) => candle.l));
+
+    const higherHigh = recentHigh > earlierHigh;
+    const higherLow = recentLow > earlierLow;
+    const lowerHigh = recentHigh < earlierHigh;
+    const lowerLow = recentLow < earlierLow;
+
+    const bullStack = latestClose >= ema20 && ema20 >= ema50 && ema50 >= ema200 && latestClose >= sma200;
+    const bearStack = latestClose <= ema20 && ema20 <= ema50 && ema50 <= ema200 && latestClose <= sma200;
+
+    let score = 0;
+    if (direction === "up") {
+      score += bullStack ? 4 : -3;
+      if (higherHigh && higherLow) {
+        score += 4;
+      } else if (lowerHigh && lowerLow) {
+        score -= 4;
+      }
+    } else if (direction === "down") {
+      score += bearStack ? 4 : -3;
+      if (lowerHigh && lowerLow) {
+        score += 4;
+      } else if (higherHigh && higherLow) {
+        score -= 4;
+      }
+    } else if ((bullStack && higherHigh && higherLow) || (bearStack && lowerHigh && lowerLow)) {
+      score += 2;
+    }
+
+    if (pattern === "breakout") {
+      if (score > 0) {
+        score += 2;
+      } else if (score < 0) {
+        score -= 2;
+      }
+    }
+
+    score = jsonStep(score, -10, 10);
+    const structure = higherHigh && higherLow
+      ? "HH/HL"
+      : lowerHigh && lowerLow
+        ? "LH/LL"
+        : "mixed";
+    const stack = bullStack ? "bullish" : bearStack ? "bearish" : "mixed";
+
+    return {
+      score,
+      note: `Trend structure (EMA20/50/200 + SMA200 ${stack}, ${structure}) impact: ${score >= 0 ? "+" : ""}${score}.`
+    };
+  }
+
+  function volumeConfirmationImpact() {
+    const buildRangeProxy = () => {
+      const proxyWindow = Math.min(30, recentCandles.length);
+      if (proxyWindow < 14) {
+        return {
+          score: 0,
+          note: "Volume confirmation unavailable for this market/timeframe; confidence kept unchanged.",
+          ratio: null,
+          confirmation: "unavailable"
+        };
+      }
+
+      const sample = recentCandles.slice(-proxyWindow);
+      const recentSegment = sample.slice(-5);
+      const baselineSegment = sample.slice(0, Math.max(8, sample.length - 5));
+      const recentAvgRange = recentSegment.reduce((sum, candle) => sum + (candle.h - candle.l), 0) / Math.max(1, recentSegment.length);
+      const baselineAvgRange = baselineSegment.reduce((sum, candle) => sum + (candle.h - candle.l), 0) / Math.max(1, baselineSegment.length);
+
+      if (!Number.isFinite(recentAvgRange) || !Number.isFinite(baselineAvgRange) || baselineAvgRange <= 0) {
+        return {
+          score: 0,
+          note: "Volume confirmation unavailable for this market/timeframe; confidence kept unchanged.",
+          ratio: null,
+          confirmation: "unavailable"
+        };
+      }
+
+      const ratio = recentAvgRange / baselineAvgRange;
+      const breakoutSetup = pattern === "breakout" || (direction === "up" && nearResistance) || (direction === "down" && nearSupport);
+      const scoreScale = breakoutSetup ? 1.3 : 1.0;
+      let score = 0;
+
+      if (ratio >= 1.6) {
+        score = Math.round(4 * scoreScale);
+      } else if (ratio >= 1.25) {
+        score = Math.round(2 * scoreScale);
+      } else if (ratio <= 0.7) {
+        score = Math.round(-3 * scoreScale);
+      } else if (ratio <= 0.85) {
+        score = Math.round(-2 * scoreScale);
+      }
+
+      const roundedRatio = Number(ratio.toFixed(2));
+      if (score > 0) {
+        return {
+          score,
+          note: `Tick volume unavailable; using range participation proxy (${roundedRatio}x vs baseline) showing strong confirmation.`,
+          ratio: roundedRatio,
+          confirmation: "strong"
+        };
+      }
+
+      if (score < 0) {
+        return {
+          score,
+          note: `Tick volume unavailable; using range participation proxy (${roundedRatio}x vs baseline) showing weak confirmation.`,
+          ratio: roundedRatio,
+          confirmation: "weak"
+        };
+      }
+
+      return {
+        score: 0,
+        note: `Tick volume unavailable; using range participation proxy (${roundedRatio}x vs baseline), neutral impact.`,
+        ratio: roundedRatio,
+        confirmation: "neutral"
+      };
+    };
+
+    const anchorIndex = (() => {
+      for (let index = recentCandles.length - 1; index >= Math.max(0, recentCandles.length - 20); index -= 1) {
+        const value = Number(recentCandles[index]?.v || 0);
+        if (Number.isFinite(value) && value > 0) {
+          return index;
+        }
+      }
+      return -1;
+    })();
+
+    if (anchorIndex < 0) {
+      return buildRangeProxy();
+    }
+
+    const latestVolume = Number(recentCandles[anchorIndex]?.v || 0);
+    const priorVolumes = recentCandles
+      .slice(Math.max(0, anchorIndex - 20), anchorIndex)
+      .map((candle) => Number(candle.v || 0))
+      .filter((value) => value > 0);
+
+    if (!Number.isFinite(latestVolume) || latestVolume <= 0 || priorVolumes.length < 8) {
+      return buildRangeProxy();
+    }
+
+    const avgVolume = priorVolumes.reduce((sum, value) => sum + value, 0) / priorVolumes.length;
+    if (!Number.isFinite(avgVolume) || avgVolume <= 0) {
+      return buildRangeProxy();
+    }
+
+    const ratio = latestVolume / avgVolume;
+    const breakoutSetup = pattern === "breakout" || (direction === "up" && nearResistance) || (direction === "down" && nearSupport);
+    const scoreScale = breakoutSetup ? 1.8 : 1.0;
+    let score = 0;
+
+    if (ratio >= 1.8) {
+      score = Math.round(5 * scoreScale);
+    } else if (ratio >= 1.35) {
+      score = Math.round(3 * scoreScale);
+    } else if (ratio <= 0.65) {
+      score = Math.round(-4 * scoreScale);
+    } else if (ratio <= 0.85) {
+      score = Math.round(-2 * scoreScale);
+    }
+
+    const roundedRatio = Number(ratio.toFixed(2));
+    if (score > 0) {
+      return {
+        score,
+        note: `Volume confirmation strong (${roundedRatio}x vs 20-bar average), supporting signal quality.`,
+        ratio: roundedRatio,
+        confirmation: "strong"
+      };
+    }
+
+    if (score < 0) {
+      return {
+        score,
+        note: `Volume confirmation weak (${roundedRatio}x vs 20-bar average), lowering breakout conviction.`,
+        ratio: roundedRatio,
+        confirmation: "weak"
+      };
+    }
+
+    return {
+      score: 0,
+      note: `Volume near baseline (${roundedRatio}x vs 20-bar average), neutral confidence impact.`,
+      ratio: roundedRatio,
+      confirmation: "neutral"
+    };
+  }
 
   if (compression) {
     pattern = "compression";
@@ -393,6 +1016,24 @@ function classifyPattern(meta, timeframe, candles, source) {
     note = `${meta.symbol} is showing directional momentum on the ${timeframeLabel(timeframe)} chart.`;
   }
 
+  const candlestick = detectCandlestickPattern(recentCandles, slope, {
+    isAtSupport: atSupport,
+    isAtResistance: atResistance
+  });
+  const candlestickImpact = candlestickImpactAtLevels(candlestick, direction, atSupport, atResistance);
+  const volumeImpact = volumeConfirmationImpact();
+  const trendImpact = trendStructureImpact();
+  confidence = jsonStep(confidence + candlestickImpact.score + volumeImpact.score + trendImpact.score, 45, 94);
+  if (direction === "neutral" && candlestick.bias !== "neutral" && candlestickImpact.score >= 5) {
+    direction = candlestick.bias;
+    pattern = "reversal";
+  }
+
+  const candlestickContext = candlestick.pattern === "none"
+    ? "Candlestick filter: none"
+    : `Candlestick filter: ${candlestick.pattern} (${candlestick.bias})`;
+  note = `${note} ${candlestickContext}. ${candlestickImpact.note} ${volumeImpact.note} ${trendImpact.note}`;
+
   return {
     symbol: meta.symbol,
     name: meta.name,
@@ -406,6 +1047,15 @@ function classifyPattern(meta, timeframe, candles, source) {
     latestClose: latest.c,
     sampleSize: recentCandles.length,
     source,
+    candlestickPattern: candlestick.pattern,
+    candlestickBias: candlestick.bias,
+    candlestickImpactScore: candlestickImpact.score,
+    volumeRatio: volumeImpact.ratio,
+    volumeImpactScore: volumeImpact.score,
+    trendImpactScore: trendImpact.score,
+    volumeConfirmation: volumeImpact.confirmation,
+    isAtSupport: atSupport,
+    isAtResistance: atResistance,
     note
   };
 }
@@ -433,15 +1083,23 @@ async function getLiveHistory(symbols, timeframes, years = 5) {
   const historiesBySymbol = new Map(
     await Promise.all(uniqueSymbols.map(async (symbol) => {
       const meta = HISTORY_SYMBOLS[symbol];
+      const brokerHistory = latestMt4History.get(normalizeForexSymbolKey(symbol)) || latestMt4Snapshot?.history?.[normalizeForexSymbolKey(symbol)] || {};
       const liveSpotPrice = meta.category === "forex" ? await fetchYahooForexSpotPrice(meta.yahooCode) : null;
-      const liveDailyCandles = await fetchYahooHistory(meta.yahooCode);
+      const liveDailyCandles = await fetchYahooHistory(meta.yahooCode, "1d", "5y");
+      const finnhubHourlyCandles = meta.category === "forex" && !brokerHistory["1hour"]
+        ? await fetchFinnhubCandles(symbol, "60", Math.floor(Date.now() / 1000) - 365 * 24 * 60 * 60, Math.floor(Date.now() / 1000))
+        : [];
+      const yahooHourlyCandles = meta.category === "forex"
+        ? await fetchYahooHistory(meta.yahooCode, "1h", "730d")
+        : [];
+      const liveHourlyCandles = brokerHistory["1hour"] || (finnhubHourlyCandles.length > 0 ? finnhubHourlyCandles : yahooHourlyCandles);
 
       const referencePrice = Number(liveSpotPrice || referencePrices.get(meta.symbol) || DEFAULT_REFERENCE_PRICES[meta.symbol] || 0);
-      const baseDailyCandles = liveDailyCandles.length > 0
+      const baseDailyCandles = brokerHistory["1Day"] || (liveDailyCandles.length > 0
         ? liveDailyCandles
-        : buildSyntheticDailyHistory(meta, years, referencePrice > 0 ? referencePrice : 1);
+        : buildSyntheticDailyHistory(meta, years, referencePrice > 0 ? referencePrice : 1));
 
-      return [symbol, { meta, liveDailyCandles, baseDailyCandles, liveSpotPrice }];
+      return [symbol, { meta, liveDailyCandles, liveHourlyCandles, baseDailyCandles, brokerHistory, liveSpotPrice }];
     }))
   );
 
@@ -451,26 +1109,40 @@ async function getLiveHistory(symbols, timeframes, years = 5) {
       continue;
     }
 
-    const { meta, liveDailyCandles, baseDailyCandles, liveSpotPrice } = symbolHistory;
+    const { meta, liveDailyCandles, liveHourlyCandles, baseDailyCandles, brokerHistory, liveSpotPrice } = symbolHistory;
     data[symbol] = {};
 
     for (const timeframe of uniqueTimeframes) {
       let frameCandles = baseDailyCandles;
       let source = "live";
       let note = `Live Yahoo daily history for ${symbol}`;
+      const forexIntraday = meta.category === "forex" && ["1hour", "4hour", "12hour"].includes(timeframe);
 
-      if (timeframe === "1Week") {
+      if (forexIntraday && liveHourlyCandles.length === 0) {
+        frameCandles = [];
+        source = "fallback";
+        note = `Live intraday OHLC unavailable for ${symbol}; no ${timeframeLabel(timeframe)} candlestick signal generated`;
+      } else if (brokerHistory[timeframe]) {
+        frameCandles = brokerHistory[timeframe];
+        note = `Live MT4 ${timeframeLabel(timeframe)} history for ${symbol}`;
+      } else if (meta.category === "forex" && liveHourlyCandles.length > 0 && timeframe === "1hour") {
+        frameCandles = liveHourlyCandles;
+        note = `Live Yahoo 1-hour history for ${symbol}`;
+      } else if (meta.category === "forex" && liveHourlyCandles.length > 0 && timeframe === "4hour") {
+        frameCandles = aggregateCandles(liveHourlyCandles, 4);
+        note = `Derived 4-hour history from live Yahoo 1-hour candles for ${symbol}`;
+      } else if (meta.category === "forex" && liveHourlyCandles.length > 0 && timeframe === "12hour") {
+        frameCandles = aggregateCandles(liveHourlyCandles, 12);
+        note = `Derived 12-hour history from live Yahoo 1-hour candles for ${symbol}`;
+      } else if (timeframe === "1Week") {
         frameCandles = aggregateCandles(frameCandles, 5);
         note = `Derived weekly history from Yahoo daily closes for ${symbol}`;
       } else if (timeframe === "12hour") {
         frameCandles = aggregateCandles(frameCandles, 2);
         note = `Derived 12-hour history from Yahoo daily closes for ${symbol}`;
       } else if (timeframe !== "1Day") {
-        note = `${symbol} does not expose public ${timeframeLabel(timeframe)} history here; using derived bars from live daily history`;
-      }
-
-      if (meta.category === "forex" && Number.isFinite(liveSpotPrice) && liveSpotPrice > 0) {
-        frameCandles = overlayLiveSpotOnCandles(frameCandles, liveSpotPrice);
+        source = "derived";
+        note = `${symbol} does not expose live ${timeframeLabel(timeframe)} history here; using derived bars from daily history`;
       }
 
       frameCandles = compressCandles(frameCandles, timeframeToTargetCount(timeframe));
@@ -545,6 +1217,428 @@ const AGENT_CONFIG = [
 ];
 
 const ANALYSIS_TIMEFRAMES = ["1hour", "4hour", "12hour", "1Day", "1Week"];
+const LIVE_AGENTS_CACHE_TTL_MS = 20_000;
+let liveAgentsCache = null;
+let liveAgentsInFlight = null;
+const SENTIMENT_FLOW_CACHE_TTL_MS = 15 * 60 * 1000;
+let sentimentFlowCache = null;
+let sentimentFlowInFlight = null;
+
+const FX_POLICY_RATE = {
+  USD: 5.5,
+  EUR: 4.25,
+  GBP: 5.0,
+  JPY: 0.25,
+  AUD: 4.35,
+  NZD: 5.5,
+  CAD: 4.75,
+  CHF: 1.25
+};
+
+function toCurrencyCodes(symbol) {
+  const parts = String(symbol || "").split("/");
+  if (parts.length !== 2) {
+    return { base: "USD", quote: "USD" };
+  }
+
+  return { base: parts[0].toUpperCase(), quote: parts[1].toUpperCase() };
+}
+
+async function fetchYahooChange(symbol) {
+  try {
+    const response = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1mo`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        Accept: "application/json,text/plain,*/*",
+        Referer: "https://finance.yahoo.com/"
+      }
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = await response.json();
+    const closes = payload?.chart?.result?.[0]?.indicators?.quote?.[0]?.close;
+    if (!Array.isArray(closes) || closes.length < 8) {
+      return null;
+    }
+
+    const clean = closes.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0);
+    if (clean.length < 8) {
+      return null;
+    }
+
+    const latest = clean[clean.length - 1];
+    const prev5 = clean[Math.max(0, clean.length - 6)];
+    const prev20 = clean[Math.max(0, clean.length - 21)];
+    const change5 = prev5 > 0 ? ((latest - prev5) / prev5) * 100 : 0;
+    const change20 = prev20 > 0 ? ((latest - prev20) / prev20) * 100 : 0;
+
+    return { latest, change5, change20 };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchEconomicCalendarRiskContext() {
+  try {
+    const response = await fetch("https://nfs.faireconomy.media/ff_calendar_thisweek.json");
+    if (!response.ok) {
+      return { byCurrency: {}, highImpactNext24h: 0 };
+    }
+
+    const payload = await response.json();
+    if (!Array.isArray(payload)) {
+      return { byCurrency: {}, highImpactNext24h: 0 };
+    }
+
+    const now = Date.now();
+    const next24h = now + (24 * 60 * 60 * 1000);
+    const byCurrency = {};
+    let highImpactNext24h = 0;
+
+    for (const event of payload) {
+      const currency = String(event?.country || event?.currency || "").toUpperCase().slice(0, 3);
+      const impact = String(event?.impact || event?.impactTitle || "").toLowerCase();
+      const date = Date.parse(event?.date || event?.timestamp || "");
+      if (!currency || !Number.isFinite(date)) {
+        continue;
+      }
+
+      const highImpact = impact.includes("high") || impact.includes("red") || Number(event?.impact_num) >= 3;
+      if (!highImpact) {
+        continue;
+      }
+
+      if (date >= now && date <= next24h) {
+        byCurrency[currency] = (byCurrency[currency] || 0) + 1;
+        highImpactNext24h += 1;
+      }
+    }
+
+    return { byCurrency, highImpactNext24h };
+  } catch {
+    return { byCurrency: {}, highImpactNext24h: 0 };
+  }
+}
+
+async function fetchCentralBankToneContext() {
+  const toneByCurrency = {};
+  const hawkishWords = ["hike", "inflation", "hawkish", "tightening", "higher rates"];
+  const dovishWords = ["cut", "recession", "dovish", "easing", "lower rates"];
+
+  for (const feedUrl of RSS_FEEDS) {
+    try {
+      const response = await fetch(feedUrl);
+      if (!response.ok) {
+        continue;
+      }
+
+      const xml = await response.text();
+      const headlineMatches = xml.match(/<title>(.*?)<\/title>/gi) || [];
+      for (const raw of headlineMatches.slice(0, 80)) {
+        const title = raw.replace(/<[^>]+>/g, " ").toLowerCase();
+        const hawkish = hawkishWords.some((word) => title.includes(word));
+        const dovish = dovishWords.some((word) => title.includes(word));
+        if (!hawkish && !dovish) {
+          continue;
+        }
+
+        const delta = hawkish ? 1 : -1;
+        const apply = (code) => {
+          toneByCurrency[code] = (toneByCurrency[code] || 0) + delta;
+        };
+
+        if (title.includes("fed") || title.includes("federal reserve") || title.includes("usd") || title.includes("dollar")) {
+          apply("USD");
+        }
+        if (title.includes("ecb") || title.includes("euro")) {
+          apply("EUR");
+        }
+        if (title.includes("boe") || title.includes("pound") || title.includes("sterling") || title.includes("uk")) {
+          apply("GBP");
+        }
+        if (title.includes("boj") || title.includes("yen") || title.includes("japan")) {
+          apply("JPY");
+        }
+        if (title.includes("rba") || title.includes("australia") || title.includes("aussie")) {
+          apply("AUD");
+        }
+        if (title.includes("rbnz") || title.includes("new zealand") || title.includes("kiwi")) {
+          apply("NZD");
+        }
+        if (title.includes("boc") || title.includes("canada") || title.includes("cad")) {
+          apply("CAD");
+        }
+        if (title.includes("snb") || title.includes("swiss") || title.includes("franc")) {
+          apply("CHF");
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return toneByCurrency;
+}
+
+async function fetchCftcCotContext() {
+  const endpoint = "https://publicreporting.cftc.gov/resource/udgc-27he.json";
+  const markets = {
+    EUR: "EURO FX",
+    GBP: "BRITISH POUND",
+    JPY: "JAPANESE YEN",
+    AUD: "AUSTRALIAN DOLLAR",
+    CAD: "CANADIAN DOLLAR",
+    NZD: "NEW ZEALAND DOLLAR",
+    CHF: "SWISS FRANC"
+  };
+
+  const entries = await Promise.all(Object.entries(markets).map(async ([currency, keyword]) => {
+    try {
+      const select = "id,market_and_exchange_names,report_date_as_yyyy_mm_dd,open_interest_all,lev_money_positions_long,lev_money_positions_short";
+      const order = encodeURIComponent("report_date_as_yyyy_mm_dd DESC");
+      const q = encodeURIComponent(keyword);
+      const url = `${endpoint}?$q=${q}&$select=${encodeURIComponent(select)}&$order=${order}&$limit=5`;
+      const response = await fetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          Accept: "application/json,text/plain,*/*"
+        }
+      });
+
+      if (!response.ok) {
+        return [currency, null, null];
+      }
+
+      const payload = await response.json();
+      const rows = Array.isArray(payload) ? payload : [];
+      const normalizedKeyword = keyword.toUpperCase();
+      const matchingRows = rows.filter((row) => String(row?.market_and_exchange_names || "").toUpperCase().includes(normalizedKeyword));
+      const preferred = matchingRows.find((row) => String(row?.id || "").toUpperCase().endsWith("C"));
+      const row = preferred || matchingRows[0] || rows[0] || null;
+      if (!row) {
+        return [currency, null, null];
+      }
+
+      const openInterest = Number(row.open_interest_all || 0);
+      const longPos = Number(row.lev_money_positions_long || 0);
+      const shortPos = Number(row.lev_money_positions_short || 0);
+      if (!Number.isFinite(openInterest) || openInterest <= 0 || !Number.isFinite(longPos) || !Number.isFinite(shortPos)) {
+        return [currency, null, null];
+      }
+
+      const netPercentOfOi = ((longPos - shortPos) / openInterest) * 100;
+      const normalized = clamp(netPercentOfOi / 2, -3, 3);
+      const reportDate = String(row.report_date_as_yyyy_mm_dd || "").slice(0, 10);
+      return [currency, normalized, reportDate || null];
+    } catch {
+      return [currency, null, null];
+    }
+  }));
+
+  const byCurrency = {};
+  let latestDate = null;
+  for (const [currency, value, reportDate] of entries) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      byCurrency[currency] = Number(value.toFixed(2));
+    }
+    if (reportDate && (!latestDate || reportDate > latestDate)) {
+      latestDate = reportDate;
+    }
+  }
+
+  return {
+    byCurrency,
+    reportDate: latestDate,
+    available: Object.keys(byCurrency).length >= 3
+  };
+}
+
+async function fetchFxssiRetailPositioningContext() {
+  const endpoint = "https://fxssi.com/api/ratios";
+  const pairMap = {
+    "EUR/USD": "EURUSD",
+    "GBP/USD": "GBPUSD",
+    "USD/JPY": "USDJPY",
+    "AUD/USD": "AUDUSD",
+    "USD/CAD": "USDCAD",
+    "USD/CHF": "USDCHF",
+    "NZD/USD": "NZDUSD",
+    "EUR/GBP": "EURGBP"
+  };
+
+  const nowUnix = Math.floor(Date.now() / 1000);
+  const time1 = nowUnix - (90 * 24 * 60 * 60);
+  const out = {};
+
+  await Promise.all(Object.entries(pairMap).map(async ([symbol, pair]) => {
+    try {
+      const params = new URLSearchParams({
+        pair,
+        view: "all",
+        time1: String(time1),
+        time2: String(nowUnix)
+      });
+      const response = await fetch(`${endpoint}?${params.toString()}`, {
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          Accept: "application/json,text/plain,*/*",
+          Referer: "https://fxssi.com/tools/current-ratio"
+        }
+      });
+
+      if (!response.ok) {
+        return;
+      }
+
+      const payload = await response.json();
+      const ratios = Array.isArray(payload?.ratios) ? payload.ratios : [];
+      const latest = ratios[ratios.length - 1];
+      const sellersPct = Number(latest?.perc);
+      if (!Number.isFinite(sellersPct)) {
+        return;
+      }
+
+      const longPct = 100 - sellersPct;
+      const shortPct = sellersPct;
+      const contrarianPairBias = clamp((shortPct - longPct) / 25, -2, 2);
+      out[symbol] = Number(contrarianPairBias.toFixed(2));
+    } catch {
+      return;
+    }
+  }));
+
+  return {
+    byPair: out,
+    available: Object.keys(out).length >= 2
+  };
+}
+
+async function fetchSentimentFlowContext() {
+  const now = Date.now();
+  if (sentimentFlowCache && (now - sentimentFlowCache.cachedAt) < SENTIMENT_FLOW_CACHE_TTL_MS) {
+    return sentimentFlowCache.value;
+  }
+
+  if (sentimentFlowInFlight) {
+    return sentimentFlowInFlight;
+  }
+
+  sentimentFlowInFlight = (async () => {
+    const [vix, dxy, eurFut, gbpFut, jpyFut, audFut, cadFut, nzdFut, calendarRisk, cbTone, cftcCot, retailPositioning] = await Promise.all([
+      fetchYahooChange("^VIX"),
+      fetchYahooChange("DX-Y.NYB"),
+      fetchYahooChange("6E=F"),
+      fetchYahooChange("6B=F"),
+      fetchYahooChange("6J=F"),
+      fetchYahooChange("6A=F"),
+      fetchYahooChange("6C=F"),
+      fetchYahooChange("6N=F"),
+      fetchEconomicCalendarRiskContext(),
+      fetchCentralBankToneContext(),
+      fetchCftcCotContext(),
+      fetchFxssiRetailPositioningContext()
+    ]);
+
+    const currencyFuturesBias = {
+      EUR: eurFut?.change20 ?? 0,
+      GBP: gbpFut?.change20 ?? 0,
+      JPY: jpyFut?.change20 ?? 0,
+      AUD: audFut?.change20 ?? 0,
+      CAD: cadFut?.change20 ?? 0,
+      NZD: nzdFut?.change20 ?? 0,
+      USD: -1 * (((eurFut?.change20 ?? 0) + (gbpFut?.change20 ?? 0) + (jpyFut?.change20 ?? 0)) / 3)
+    };
+
+    const riskScore = (() => {
+      const vixShock = vix?.change5 ?? 0;
+      const dxyMove = dxy?.change5 ?? 0;
+      let score = 0;
+      if (vixShock <= -6) {
+        score += 2;
+      } else if (vixShock >= 6) {
+        score -= 2;
+      }
+      if (dxyMove <= -0.8) {
+        score += 1;
+      } else if (dxyMove >= 0.8) {
+        score -= 1;
+      }
+      return clamp(score, -3, 3);
+    })();
+
+    const context = {
+      riskScore,
+      dxyChange5: dxy?.change5 ?? 0,
+      vixChange5: vix?.change5 ?? 0,
+      calendarRiskByCurrency: calendarRisk.byCurrency,
+      highImpactNext24h: calendarRisk.highImpactNext24h,
+      centralBankToneByCurrency: cbTone,
+      currencyFuturesBias,
+      cftcCotBiasByCurrency: cftcCot.byCurrency,
+      cftcCotReportDate: cftcCot.reportDate,
+      retailPositioningByPair: retailPositioning.byPair,
+      policyRates: FX_POLICY_RATE,
+      source: cftcCot.available
+        ? (retailPositioning.available ? "live-mixed+cftc+retail" : "live-mixed+cftc")
+        : (retailPositioning.available ? "live-mixed+retail" : "live-mixed")
+    };
+
+    sentimentFlowCache = { value: context, cachedAt: Date.now() };
+    return context;
+  })().finally(() => {
+    sentimentFlowInFlight = null;
+  });
+
+  return sentimentFlowInFlight;
+}
+
+function normalizeForexSymbolKey(symbol) {
+  return String(symbol || "").toUpperCase().replace(/[^A-Z]/g, "");
+}
+
+function buildMt4MidPriceMap() {
+  const map = new Map();
+
+  if (!latestMt4Snapshot || !Array.isArray(latestMt4Snapshot.quotes)) {
+    return map;
+  }
+
+  for (const quote of latestMt4Snapshot.quotes) {
+    const bid = Number(quote?.bid);
+    const ask = Number(quote?.ask);
+    if (!Number.isFinite(bid) || !Number.isFinite(ask)) {
+      continue;
+    }
+
+    const mid = (bid + ask) / 2;
+    if (!Number.isFinite(mid) || mid <= 0) {
+      continue;
+    }
+
+    map.set(normalizeForexSymbolKey(quote.symbol), mid);
+  }
+
+  return map;
+}
+
+function resolveLiveSpotPriceFromMt4(symbol, midPriceMap) {
+  const normalized = normalizeForexSymbolKey(symbol);
+  const direct = midPriceMap.get(normalized);
+  if (Number.isFinite(direct) && direct > 0) {
+    return direct;
+  }
+
+  for (const [key, value] of midPriceMap.entries()) {
+    if (key.startsWith(normalized) || normalized.startsWith(key)) {
+      return value;
+    }
+  }
+
+  return null;
+}
 
 const TIMEFRAME_WEIGHTS = {
   "1hour": 5,
@@ -815,6 +1909,90 @@ function buildFundamentalAnalysis(category, symbol, direction) {
   };
 }
 
+function scoreDirection(direction) {
+  if (direction === "up") {
+    return 1;
+  }
+
+  if (direction === "down") {
+    return -1;
+  }
+
+  return 0;
+}
+
+function buildSentimentFlowProxy(symbol, timeframe, direction, pattern, technicals, fundamentals, liveContext) {
+  const dir = scoreDirection(direction);
+  const trendBias = scoreDirection(technicals.ema20 >= technicals.ema50 ? "up" : "down");
+  const macdBias = scoreDirection(technicals.macdHistogram >= 0 ? "up" : "down");
+  const safeHavenCross = symbol.includes("JPY") || symbol.includes("CHF");
+  const currencies = toCurrencyCodes(symbol);
+  const policyRates = liveContext?.policyRates || FX_POLICY_RATE;
+  const baseRate = Number(policyRates[currencies.base] || 0);
+  const quoteRate = Number(policyRates[currencies.quote] || 0);
+  const liveCbTone = liveContext?.centralBankToneByCurrency || {};
+  const baseTone = Number(liveCbTone[currencies.base] || 0);
+  const quoteTone = Number(liveCbTone[currencies.quote] || 0);
+  const calendarByCurrency = liveContext?.calendarRiskByCurrency || {};
+  const calendarHits = Number(calendarByCurrency[currencies.base] || 0) + Number(calendarByCurrency[currencies.quote] || 0);
+  const futuresBias = liveContext?.currencyFuturesBias || {};
+  const cftcCotBias = liveContext?.cftcCotBiasByCurrency || {};
+  const hasCftcPair = Number.isFinite(Number(cftcCotBias[currencies.base])) || Number.isFinite(Number(cftcCotBias[currencies.quote]));
+  const cotDeltaFromCftc = Number(cftcCotBias[currencies.base] || 0) - Number(cftcCotBias[currencies.quote] || 0);
+  const cotDeltaFromFutures = Number(futuresBias[currencies.base] || 0) - Number(futuresBias[currencies.quote] || 0);
+  const cotReport = hasCftcPair
+    ? clamp(Math.round(cotDeltaFromCftc), -3, 3)
+    : clamp(Math.round(cotDeltaFromFutures / 1.5), -3, 3);
+  const cotSource = hasCftcPair ? "cftc" : "futures-proxy";
+  const interestRateDifferential = clamp(Math.round((baseRate - quoteRate) / 1.25) * dir, -3, 3);
+  const centralBankCommentary = clamp(Math.round((baseTone - quoteTone) / 2), -3, 3);
+  const riskOnRiskOff = clamp((safeHavenCross ? -1 : 1) * (liveContext?.riskScore || 0) + (safeHavenCross ? -dir : dir), -3, 3);
+  const optionsMarket = clamp((macdBias === dir ? 1 : -1) + ((pattern === "breakout" || pattern === "trend") ? dir : 0), -2, 2);
+  const retailByPair = liveContext?.retailPositioningByPair || {};
+  const retailPairBias = Number(retailByPair[symbol]);
+  const hasRetailFeed = Number.isFinite(retailPairBias);
+  const retailPositioning = hasRetailFeed
+    ? clamp(Math.round(retailPairBias * (dir === 0 ? 1 : dir)), -2, 2)
+    : clamp((dir === 0 ? 0 : -dir) + (pattern === "reversal" ? dir : 0), -2, 2);
+  const eventRiskPenalty = calendarHits >= 3 ? -2 : calendarHits >= 1 ? -1 : 0;
+  const economicCalendar = clamp(eventRiskPenalty + ((pattern === "breakout" || pattern === "momentum") ? dir : 0), -3, 3);
+
+  const rawImpact = cotReport
+    + interestRateDifferential
+    + centralBankCommentary
+    + riskOnRiskOff
+    + optionsMarket
+    + retailPositioning
+    + economicCalendar;
+  const impactScore = clamp(rawImpact, -10, 10);
+
+  const breakdown = {
+    cotReport,
+    interestRateDifferential,
+    centralBankCommentary,
+    riskOnRiskOff,
+    optionsMarket,
+    retailPositioning,
+    economicCalendar,
+    cotSource,
+    retailSource: hasRetailFeed ? "fxssi" : "model-proxy",
+    cftcReportDate: liveContext?.cftcCotReportDate || null,
+    source: liveContext?.source || "proxy"
+  };
+
+  const summary = [
+    `COT ${cotReport >= 0 ? "+" : ""}${cotReport} (${cotSource})`,
+    `Rates ${interestRateDifferential >= 0 ? "+" : ""}${interestRateDifferential}`,
+    `CB ${centralBankCommentary >= 0 ? "+" : ""}${centralBankCommentary}`,
+    `Risk ${riskOnRiskOff >= 0 ? "+" : ""}${riskOnRiskOff}`,
+    `Options ${optionsMarket >= 0 ? "+" : ""}${optionsMarket}`,
+    `Retail ${retailPositioning >= 0 ? "+" : ""}${retailPositioning}`,
+    `Calendar ${economicCalendar >= 0 ? "+" : ""}${economicCalendar}`
+  ].join(" | ");
+
+  return { impactScore, summary, breakdown };
+}
+
 function buildDeepDiveDimension(technicals, fundamentals, pattern, strategiesApplied) {
   const technicalFocus = [
     `EMA20 ${technicals.ema20} vs EMA50 ${technicals.ema50}`,
@@ -940,17 +2118,22 @@ function buildTradePlan(price, support, resistance, direction, pattern, confiden
   };
 }
 
-function buildSignal(symbol, category, timeframe, pattern, candles, source, liveSpotPrice) {
+function buildSignal(symbol, category, timeframe, pattern, candles, source, liveSpotPrice, sentimentFlowContext) {
+  if (!pattern.candlestickPattern || pattern.candlestickPattern === "none") {
+    return null;
+  }
+
   const latest = candles[candles.length - 1] || null;
   const currentPrice = liveSpotPrice ?? latest?.c ?? pattern.latestClose;
   const lastOccurrenceAt = latest
     ? new Date((latest.t > 1e12 ? latest.t : latest.t * 1000)).toISOString()
     : new Date().toISOString();
-  const confidence = Math.round(pattern.confidence);
   const strategiesApplied = strategiesForPattern(pattern.pattern, pattern.direction, category, symbol);
-  const tradePlan = buildTradePlan(currentPrice, pattern.support, pattern.resistance, pattern.direction, pattern.pattern, confidence, timeframe, category);
   const technicals = buildTechnicalAnalysis(symbol, timeframe, candles, pattern.support, pattern.resistance);
   const fundamentals = buildFundamentalAnalysis(category, symbol, pattern.direction);
+  const sentimentFlow = buildSentimentFlowProxy(symbol, timeframe, pattern.direction, pattern.pattern, technicals, fundamentals, sentimentFlowContext);
+  const confidence = Math.round(clamp(Math.round(pattern.confidence) + sentimentFlow.impactScore, 45, 94));
+  const tradePlan = buildTradePlan(currentPrice, pattern.support, pattern.resistance, pattern.direction, pattern.pattern, confidence, timeframe, category);
   const deepDive = buildDeepDiveDimension(technicals, fundamentals, pattern, strategiesApplied);
 
   return {
@@ -958,11 +2141,23 @@ function buildSignal(symbol, category, timeframe, pattern, candles, source, live
     timeframe,
     pattern: pattern.pattern,
     confidence,
+    candlestickPattern: pattern.candlestickPattern,
+    candlestickBias: pattern.candlestickBias,
+    candlestickImpactScore: pattern.candlestickImpactScore,
+    volumeRatio: pattern.volumeRatio,
+    volumeImpactScore: pattern.volumeImpactScore,
+    trendImpactScore: pattern.trendImpactScore,
+    sentimentFlowImpactScore: sentimentFlow.impactScore,
+    sentimentFlowSummary: sentimentFlow.summary,
+    sentimentFlowBreakdown: sentimentFlow.breakdown,
+    volumeConfirmation: pattern.volumeConfirmation,
+    isAtSupport: pattern.isAtSupport,
+    isAtResistance: pattern.isAtResistance,
     direction: pattern.direction,
     currentPrice: roundTo(currentPrice),
     lastOccurrenceAt,
     source,
-    strategySummary: `${pattern.pattern.toUpperCase()} on ${pattern.symbol} (${pattern.timeframe}) with ${confidence}% confidence. ${technicals.summary} ${fundamentals.summary}`,
+    strategySummary: `${pattern.pattern.toUpperCase()} on ${pattern.symbol} (${pattern.timeframe}) with ${confidence}% confidence (includes sentiment/flow ${sentimentFlow.impactScore >= 0 ? "+" : ""}${sentimentFlow.impactScore}: ${sentimentFlow.summary}). ${technicals.summary} ${fundamentals.summary}`,
     strategiesApplied,
     tradePlan,
     support: roundTo(pattern.support),
@@ -982,10 +2177,12 @@ function pickBestSignal(signals) {
   }, signals[0]);
 }
 
-async function getLiveAgents() {
+async function buildLiveAgents() {
   const reports = [];
   const sources = new Set();
   const generatedAt = new Date().toISOString();
+  const mt4MidPrices = buildMt4MidPriceMap();
+  const sentimentFlowContext = await fetchSentimentFlowContext();
 
   for (const config of AGENT_CONFIG) {
     const history = await getLiveHistory(config.symbols, ANALYSIS_TIMEFRAMES, 5);
@@ -993,7 +2190,9 @@ async function getLiveAgents() {
     const agentSignals = [];
 
     for (const symbol of config.symbols) {
-      const liveSpotPrice = config.category === "forex" ? await fetchYahooForexSpotPrice(HISTORY_SYMBOLS[symbol].yahooCode) : null;
+      const liveSpotPrice = config.category === "forex"
+        ? (resolveLiveSpotPriceFromMt4(symbol, mt4MidPrices) ?? await fetchYahooForexSpotPrice(HISTORY_SYMBOLS[symbol].yahooCode))
+        : null;
       const symbolHistory = history.data[symbol] || {};
       const timeframeSignals = ANALYSIS_TIMEFRAMES.map((timeframe) => {
         const frame = symbolHistory[timeframe];
@@ -1002,8 +2201,11 @@ async function getLiveAgents() {
           return null;
         }
 
-        sources.add(frame.source);
-        return buildSignal(symbol, config.category, timeframe, pattern, frame.candles, frame.source, config.category === "forex" ? liveSpotPrice : null);
+        const signal = buildSignal(symbol, config.category, timeframe, pattern, frame.candles, frame.source, config.category === "forex" ? liveSpotPrice : null, sentimentFlowContext);
+        if (signal) {
+          sources.add(frame.source);
+        }
+        return signal;
       }).filter(Boolean);
 
       if (timeframeSignals.length === 0) {
@@ -1077,6 +2279,31 @@ async function getLiveAgents() {
     reason: "Three analysis agents built from live/derived price history with technical indicators, macro drivers, strategy plans, and graph placeholders.",
     generatedAt
   };
+}
+
+async function getLiveAgents() {
+  const now = Date.now();
+  if (liveAgentsCache && (now - liveAgentsCache.cachedAt) < LIVE_AGENTS_CACHE_TTL_MS) {
+    return liveAgentsCache.value;
+  }
+
+  if (liveAgentsInFlight) {
+    return liveAgentsInFlight;
+  }
+
+  liveAgentsInFlight = buildLiveAgents()
+    .then((result) => {
+      liveAgentsCache = {
+        value: result,
+        cachedAt: Date.now()
+      };
+      return result;
+    })
+    .finally(() => {
+      liveAgentsInFlight = null;
+    });
+
+  return liveAgentsInFlight;
 }
 
 function evaluateTradeStatusByLevels(direction, stopLoss, takeProfit, currentPrice) {
@@ -1658,6 +2885,7 @@ function renderMonitoringHistoryHtml(report) {
 }
 
 let latestMt4Snapshot = null;
+const latestMt4History = new Map();
 
 function getHeaderValue(event, headerName) {
   const headers = event?.headers || {};
@@ -1745,6 +2973,33 @@ function normalizeMt4Snapshot(body) {
       }))
     : [];
 
+  const history = {};
+  if (body.history && typeof body.history === "object") {
+    for (const [rawSymbol, frames] of Object.entries(body.history)) {
+      if (!frames || typeof frames !== "object") {
+        continue;
+      }
+
+      const symbol = String(rawSymbol).toUpperCase().replace(/[^A-Z]/g, "");
+      history[symbol] = {};
+      for (const timeframe of ["1hour", "4hour", "1Day", "1Week"]) {
+        const candles = Array.isArray(frames[timeframe])
+          ? frames[timeframe].map((candle) => ({
+            t: Number(candle.t),
+            o: Number(candle.o),
+            h: Number(candle.h),
+            l: Number(candle.l),
+            c: Number(candle.c),
+            v: Number(candle.v) || 0
+          })).filter((candle) => [candle.t, candle.o, candle.h, candle.l, candle.c].every((value) => Number.isFinite(value)))
+          : [];
+        if (candles.length > 0) {
+          history[symbol][timeframe] = candles;
+        }
+      }
+    }
+  }
+
   return {
     accountId,
     terminalId,
@@ -1757,7 +3012,8 @@ function normalizeMt4Snapshot(body) {
     freeMargin: toNumberOrUndefined(body.freeMargin),
     positions,
     pendingOrders,
-    quotes
+    quotes,
+    history
   };
 }
 
@@ -1795,6 +3051,10 @@ async function storeMt4Snapshot(snapshot) {
   };
 
   latestMt4Snapshot = materialized;
+  latestMt4History.clear();
+  for (const [symbol, frames] of Object.entries(snapshot.history || {})) {
+    latestMt4History.set(symbol, frames);
+  }
 
   if (dynamoClient && DynamoPutCommand) {
     try {

@@ -20,6 +20,7 @@ export type OhlcCandle = {
   h: number;
   l: number;
   c: number;
+  v?: number;
 };
 
 export type ForexCandlesResponse = {
@@ -248,7 +249,8 @@ function aggregateCandles(candles: OhlcCandle[], bucket: number): OhlcCandle[] {
       o: chunk[0].o,
       h: Math.max(...chunk.map((candle) => candle.h)),
       l: Math.min(...chunk.map((candle) => candle.l)),
-      c: chunk[chunk.length - 1].c
+      c: chunk[chunk.length - 1].c,
+      v: chunk.reduce((sum, candle) => sum + (Number(candle.v) || 0), 0)
     });
   }
 
@@ -285,6 +287,7 @@ async function fetchFinnhubCandles(
     h?: unknown;
     l?: unknown;
     c?: unknown;
+    v?: unknown;
   };
 
   if (payload.s !== "ok") {
@@ -295,6 +298,8 @@ async function fetchFinnhubCandles(
     return [];
   }
 
+  const volumes = isFiniteNumberArray(payload.v) ? payload.v : [];
+
   const length = Math.min(payload.t.length, payload.o.length, payload.h.length, payload.l.length, payload.c.length);
   const candles: OhlcCandle[] = [];
   for (let i = 0; i < length; i += 1) {
@@ -303,7 +308,8 @@ async function fetchFinnhubCandles(
       o: payload.o[i],
       h: payload.h[i],
       l: payload.l[i],
-      c: payload.c[i]
+      c: payload.c[i],
+      v: Number.isFinite(volumes[i]) ? volumes[i] : 0
     });
   }
 
