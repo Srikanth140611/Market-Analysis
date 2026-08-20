@@ -6,6 +6,7 @@ export type StockSuggestion = {
   name: string;
   price: number;
   changePercent: number;
+  source?: "live" | "fallback";
   rationale: string;
   sector?: string;
   score?: number;
@@ -23,6 +24,7 @@ const fallbackSuggestions: StockSuggestion[] = [
     name: "Microsoft Corp",
     price: 431.2,
     changePercent: 1.92,
+    source: "fallback",
     sector: "Technology",
     rationale: "Strong earnings momentum and sustained institutional buying pressure.",
     score: 82,
@@ -38,6 +40,7 @@ const fallbackSuggestions: StockSuggestion[] = [
     name: "NVIDIA Corp",
     price: 128.6,
     changePercent: 2.33,
+    source: "fallback",
     sector: "Semiconductors",
     rationale: "High relative strength and leadership in AI infrastructure demand.",
     score: 87,
@@ -53,6 +56,7 @@ const fallbackSuggestions: StockSuggestion[] = [
     name: "Exxon Mobil Corp",
     price: 116.74,
     changePercent: 1.14,
+    source: "fallback",
     sector: "Energy",
     rationale: "Oil price resilience and stable cash flow support the trend continuation.",
     score: 79,
@@ -64,6 +68,8 @@ const fallbackSuggestions: StockSuggestion[] = [
     }
   }
 ];
+
+const TOP_SHARES_COUNT = 20;
 
 type UniverseStock = {
   symbol: string;
@@ -109,8 +115,45 @@ const universe: UniverseStock[] = [
   { symbol: "XOM", name: "Exxon Mobil Corp", sector: "Energy" },
   { symbol: "CVX", name: "Chevron Corp", sector: "Energy" },
   { symbol: "RIO", name: "Rio Tinto", sector: "Materials" },
-  { symbol: "BHP", name: "BHP Group", sector: "Materials" }
+  { symbol: "BHP", name: "BHP Group", sector: "Materials" },
+  { symbol: "UNH", name: "UnitedHealth Group", sector: "Healthcare" },
+  { symbol: "JNJ", name: "Johnson & Johnson", sector: "Healthcare" },
+  { symbol: "PG", name: "Procter & Gamble", sector: "Consumer" },
+  { symbol: "KO", name: "Coca-Cola Co", sector: "Consumer" },
+  { symbol: "PEP", name: "PepsiCo Inc", sector: "Consumer" },
+  { symbol: "WMT", name: "Walmart Inc", sector: "Consumer" },
+  { symbol: "HD", name: "Home Depot", sector: "Consumer" },
+  { symbol: "MCD", name: "McDonald's", sector: "Consumer" },
+  { symbol: "ABBV", name: "AbbVie Inc", sector: "Healthcare" },
+  { symbol: "LLY", name: "Eli Lilly", sector: "Healthcare" },
+  { symbol: "MRK", name: "Merck & Co", sector: "Healthcare" },
+  { symbol: "BAC", name: "Bank of America", sector: "Financials" },
+  { symbol: "V", name: "Visa Inc", sector: "Financials" },
+  { symbol: "MA", name: "Mastercard Inc", sector: "Financials" },
+  { symbol: "COST", name: "Costco Wholesale", sector: "Consumer" },
+  { symbol: "NFLX", name: "Netflix Inc", sector: "Technology" },
+  { symbol: "AMD", name: "Advanced Micro Devices", sector: "Semiconductors" },
+  { symbol: "ORCL", name: "Oracle Corp", sector: "Technology" }
 ];
+
+function rankAndLimit(items: StockSuggestion[], limit = TOP_SHARES_COUNT) {
+  return items
+    .slice()
+    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+    .slice(0, limit);
+}
+
+function mergeUniqueSuggestions(...batches: StockSuggestion[][]) {
+  const merged = new Map<string, StockSuggestion>();
+  for (const batch of batches) {
+    for (const item of batch) {
+      if (!merged.has(item.symbol)) {
+        merged.set(item.symbol, item);
+      }
+    }
+  }
+  return Array.from(merged.values());
+}
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
@@ -200,7 +243,7 @@ async function getAlphaVantageSuggestions(): Promise<StockSuggestion[] | null> {
       }>;
     };
 
-    const picks = (payload.top_gainers ?? []).slice(0, 5).map((item) => {
+    const picks = (payload.top_gainers ?? []).slice(0, TOP_SHARES_COUNT).map((item) => {
       const change = Number.parseFloat(item.change_percentage.replace("%", ""));
       const price = Number.parseFloat(item.price);
 
@@ -210,6 +253,7 @@ async function getAlphaVantageSuggestions(): Promise<StockSuggestion[] | null> {
         price: Number.isFinite(price) ? price : 0,
         changePercent: Number.isFinite(change) ? change : 0,
         rationale: "Strong upside momentum with elevated participation in current sessions.",
+        source: "live",
         score: clamp((Number.isFinite(change) ? change : 0) * 8 + 50, 0, 100),
         factorScores: {
           momentum: clamp((Number.isFinite(change) ? change : 0) * 10 + 50, 0, 100),
@@ -272,6 +316,7 @@ async function getYahooSuggestions(): Promise<StockSuggestion[] | null> {
           price,
           changePercent,
           score: Number(score.toFixed(1)),
+          source: "live",
           factorScores: {
             momentum: Number(momentum.toFixed(1)),
             volatility,
@@ -288,7 +333,7 @@ async function getYahooSuggestions(): Promise<StockSuggestion[] | null> {
       })
       .filter((item): item is NonNullable<typeof item> => item !== null)
       .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
-      .slice(0, 5);
+      .slice(0, TOP_SHARES_COUNT);
 
     return suggestions.length > 0 ? suggestions : null;
   } catch {
@@ -298,14 +343,10 @@ async function getYahooSuggestions(): Promise<StockSuggestion[] | null> {
 
 export async function getBestShares(): Promise<StockSuggestion[]> {
   if (!config.FINNHUB_API_KEY) {
-    const yahoo = await getYahooSuggestions();
-    if (yahoo) {
-      return yahoo;
-    }
-
-    const alpha = await getAlphaVantageSuggestions();
-    if (alpha) {
-      return alpha;
+    const [yahoo, alpha] = await Promise.all([getYahooSuggestions(), getAlphaVantageSuggestions()]);
+    const merged = rankAndLimit(mergeUniqueSuggestions(yahoo ?? [], alpha ?? [], fallbackSuggestions));
+    if (merged.length > 0) {
+      return merged;
     }
 
     if (config.STRICT_LIVE_MODE) {
@@ -380,6 +421,7 @@ export async function getBestShares(): Promise<StockSuggestion[]> {
             price: quote.c,
             changePercent: quote.dp,
             score: Number(score.toFixed(1)),
+            source: "live",
             factorScores: {
               momentum: Number(momentum.toFixed(1)),
               volatility: Number(volatility.toFixed(1)),
@@ -401,22 +443,11 @@ export async function getBestShares(): Promise<StockSuggestion[]> {
 
     const validCandidates = candidates.filter((item): item is NonNullable<typeof item> => item !== null);
 
-    const ranked = validCandidates
-      .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
-      .slice(0, 5);
+    const [yahoo, alpha] = await Promise.all([getYahooSuggestions(), getAlphaVantageSuggestions()]);
+    const ranked = rankAndLimit(mergeUniqueSuggestions(validCandidates, yahoo ?? [], alpha ?? [], fallbackSuggestions));
 
     if (ranked.length > 0) {
       return ranked;
-    }
-
-    const yahoo = await getYahooSuggestions();
-    if (yahoo) {
-      return yahoo;
-    }
-
-    const alpha = await getAlphaVantageSuggestions();
-    if (alpha) {
-      return alpha;
     }
 
     if (config.STRICT_LIVE_MODE) {
@@ -425,14 +456,10 @@ export async function getBestShares(): Promise<StockSuggestion[]> {
 
     return fallbackSuggestions;
   } catch {
-    const yahoo = await getYahooSuggestions();
-    if (yahoo) {
-      return yahoo;
-    }
-
-    const alpha = await getAlphaVantageSuggestions();
-    if (alpha) {
-      return alpha;
+    const [yahoo, alpha] = await Promise.all([getYahooSuggestions(), getAlphaVantageSuggestions()]);
+    const merged = rankAndLimit(mergeUniqueSuggestions(yahoo ?? [], alpha ?? [], fallbackSuggestions));
+    if (merged.length > 0) {
+      return merged;
     }
 
     if (config.STRICT_LIVE_MODE) {

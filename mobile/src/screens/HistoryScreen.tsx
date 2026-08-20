@@ -11,7 +11,7 @@ const ASSET_SYMBOLS = {
   oil: ["BRENT", "WTI"]
 } as const;
 
-const TIMEFRAMES: MarketHistoryTimeframe[] = ["1minute", "5minute", "1hour", "4hour", "8hour", "12hour", "1Day", "1Week"];
+const TIMEFRAMES: MarketHistoryTimeframe[] = ["1hour", "4hour", "12hour", "1Day", "1Week"];
 
 type AssetKey = keyof typeof ASSET_SYMBOLS;
 type MarketSymbol = (typeof ASSET_SYMBOLS)[AssetKey][number];
@@ -22,16 +22,10 @@ function formatPrice(value: number) {
 
 function formatTimeframeLabel(timeframe: MarketHistoryTimeframe) {
   switch (timeframe) {
-    case "1minute":
-      return "1 minute";
-    case "5minute":
-      return "5 minute";
     case "1hour":
       return "1 hour";
     case "4hour":
       return "4 hour";
-    case "8hour":
-      return "8 hour";
     case "12hour":
       return "12 hour";
     case "1Day":

@@ -5,11 +5,150 @@ import {
   MarketHistoryResponse,
   MarketHistoryTimeframe,
   MarketAgentsResponse,
+  ForexTradeMonitoringHistoryReport,
+  ForexTradeMonitoringReport,
   MarketTrendsResponse,
   NewsFeedResponse,
   NotifierStatus,
+  Mt4Snapshot,
+  Mt4QuoteFeedResponse,
+  Mt4SnapshotResponse,
   StockSuggestion
 } from "../types";
+
+const RATE_LIMIT_COOLDOWN_MS = 45_000;
+const TIMEOUT_COOLDOWN_MS = 10_000;
+const SHARED_CACHE_MAX_AGE_MS = 15 * 60_000;
+const STALE_SHARED_CACHE_MAX_AGE_MS = 24 * 60 * 60_000;
+const TAB_LEADER_STALE_MS = 90_000;
+const TAB_LEADER_KEY = "market-analysis:poll-leader";
+const SHARED_CACHE_PREFIX = "market-analysis:cache:";
+const baseUrlCooldownUntil = new Map<string, number>();
+const jsonResponseCache = new Map<string, unknown>();
+let apiNotice: string | null = null;
+
+const TAB_ID = (() => {
+  if (typeof window === "undefined") {
+    return "server";
+  }
+
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+
+  return `${Date.now()}-${Math.round(Math.random() * 1_000_000)}`;
+})();
+
+function cacheKeyFor(path: string, baseUrl: string) {
+  return `${baseUrl || "relative"}:${path}`;
+}
+
+function canUseBrowserStorage() {
+  return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
+}
+
+function sharedStorageCacheKey(path: string, baseUrl: string) {
+  return `${SHARED_CACHE_PREFIX}${cacheKeyFor(path, baseUrl)}`;
+}
+
+function readSharedCache<T>(path: string, baseUrl: string, maxAgeMs = SHARED_CACHE_MAX_AGE_MS): T | null {
+  if (!canUseBrowserStorage()) {
+    return null;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(sharedStorageCacheKey(path, baseUrl));
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as { savedAt?: number; payload?: unknown };
+    if (!parsed || typeof parsed.savedAt !== "number") {
+      return null;
+    }
+
+    if ((Date.now() - parsed.savedAt) > maxAgeMs) {
+      return null;
+    }
+
+    return (parsed.payload ?? null) as T | null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSharedCache<T>(path: string, baseUrl: string, payload: T) {
+  if (!canUseBrowserStorage()) {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(sharedStorageCacheKey(path, baseUrl), JSON.stringify({
+      savedAt: Date.now(),
+      payload
+    }));
+  } catch {
+    // Ignore storage write failures.
+  }
+}
+
+function shouldCurrentTabFetch() {
+  if (!canUseBrowserStorage()) {
+    return true;
+  }
+
+  const now = Date.now();
+
+  try {
+    const current = window.localStorage.getItem(TAB_LEADER_KEY);
+    if (current) {
+      const leader = JSON.parse(current) as { tabId?: string; timestamp?: number };
+      if (leader.tabId === TAB_ID) {
+        window.localStorage.setItem(TAB_LEADER_KEY, JSON.stringify({ tabId: TAB_ID, timestamp: now }));
+        return true;
+      }
+
+      if (typeof leader.timestamp === "number" && (now - leader.timestamp) < TAB_LEADER_STALE_MS) {
+        return false;
+      }
+    }
+
+    window.localStorage.setItem(TAB_LEADER_KEY, JSON.stringify({ tabId: TAB_ID, timestamp: now }));
+    const confirm = window.localStorage.getItem(TAB_LEADER_KEY);
+    if (!confirm) {
+      return true;
+    }
+
+    const parsed = JSON.parse(confirm) as { tabId?: string };
+    return parsed.tabId === TAB_ID;
+  } catch {
+    return true;
+  }
+}
+
+function normalizeErrorMessage(error: unknown) {
+  if (error instanceof DOMException && error.name === "AbortError") {
+    return "Request timed out";
+  }
+
+  return error instanceof Error ? error.message : "Unable to reach API";
+}
+
+function isRateLimitMessage(message: string) {
+  return /429|rate limit|rate exceeded/i.test(message);
+}
+
+function isTimeoutMessage(message: string) {
+  return /timed out|abort/i.test(message);
+}
+
+function setApiNotice(message: string | null) {
+  apiNotice = message;
+}
+
+export function getApiNotice() {
+  return apiNotice;
+}
 
 function withBase(path: string, baseUrl: string) {
   if (!baseUrl) {
@@ -41,18 +180,52 @@ function getReachableBaseUrls() {
   return API_BASE_URL_CANDIDATES.filter((baseUrl) => !baseUrl.startsWith("http://"));
 }
 
+async function fetchWithTimeout(input: string, init?: RequestInit, timeoutMs = 20_000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function requestWithFallback(path: string, init?: RequestInit) {
   let lastError: unknown = null;
+  const now = Date.now();
+
+  if (!shouldCurrentTabFetch()) {
+    throw new Error("Follower tab using shared cache");
+  }
 
   for (const baseUrl of getReachableBaseUrls()) {
+    const cooldownUntil = baseUrlCooldownUntil.get(baseUrl) ?? 0;
+    if (cooldownUntil > now) {
+      lastError = new Error("Request failed: 429");
+      continue;
+    }
+
     try {
-      const response = await fetch(withBase(path, baseUrl), init);
+      const response = await fetchWithTimeout(withBase(path, baseUrl), init);
+      if (response.status === 429) {
+        baseUrlCooldownUntil.set(baseUrl, Date.now() + RATE_LIMIT_COOLDOWN_MS);
+      }
+
       if (!response.ok) {
         throw new Error(`Request failed: ${response.status}`);
       }
       return response;
     } catch (error) {
-      lastError = error;
+      const message = normalizeErrorMessage(error);
+      if (isTimeoutMessage(message)) {
+        baseUrlCooldownUntil.set(baseUrl, Date.now() + TIMEOUT_COOLDOWN_MS);
+      }
+
+      lastError = new Error(message);
     }
   }
 
@@ -361,17 +534,69 @@ const fallbackNotifierStatus: NotifierStatus = {
 };
 
 async function getJson<T>(path: string): Promise<T> {
-  const response = await requestWithFallback(path, {
-    cache: "no-store",
-    headers: {
-      "Cache-Control": "no-cache, no-store, max-age=0",
-      Pragma: "no-cache"
+  const method = "GET";
+  const baseCandidates = getReachableBaseUrls();
+  const cacheCandidates = baseCandidates.map((baseUrl) => cacheKeyFor(path, baseUrl));
+
+  try {
+    const response = await requestWithFallback(path, {
+      cache: "no-store",
+      headers: {
+        "Cache-Control": "no-cache, no-store, max-age=0",
+        Pragma: "no-cache"
+      }
+    });
+    if (!response.ok) {
+      throw new Error(`Request failed: ${response.status}`);
     }
-  });
-  if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`);
+
+    const payload = (await response.json()) as T;
+    setApiNotice(null);
+    if (method === "GET") {
+      for (const baseUrl of baseCandidates) {
+        const key = cacheKeyFor(path, baseUrl);
+        jsonResponseCache.set(key, payload);
+        writeSharedCache(path, baseUrl, payload);
+      }
+    }
+    return payload;
+  } catch (error) {
+    const message = normalizeErrorMessage(error);
+    const useCache = isRateLimitMessage(message) || isTimeoutMessage(message) || /Follower tab using shared cache/i.test(message);
+
+    if (useCache) {
+      const notice = null;
+
+      for (const key of cacheCandidates) {
+        const cached = jsonResponseCache.get(key);
+        if (cached) {
+          setApiNotice(notice);
+          return cached as T;
+        }
+      }
+
+      for (const baseUrl of baseCandidates) {
+        const shared = readSharedCache<T>(path, baseUrl);
+        if (shared) {
+          setApiNotice(notice);
+          return shared;
+        }
+      }
+
+      // If fresh cache is unavailable, allow stale shared cache to avoid hard failures during prolonged throttling.
+      for (const baseUrl of baseCandidates) {
+        const staleShared = readSharedCache<T>(path, baseUrl, STALE_SHARED_CACHE_MAX_AGE_MS);
+        if (staleShared) {
+          setApiNotice(null);
+          return staleShared;
+        }
+      }
+
+      setApiNotice(null);
+    }
+
+    throw new Error(message);
   }
-  return (await response.json()) as T;
 }
 
 export async function fetchGlobalNews() {
@@ -450,6 +675,57 @@ export async function fetchMarketAgents() {
     return await getJson<MarketAgentsResponse>("/api/market/agents");
   } catch (error) {
     throw new Error(error instanceof Error ? error.message : "Failed to load market agents");
+  }
+}
+
+export async function fetchForexMonitoringReport() {
+  try {
+    return await getJson<ForexTradeMonitoringReport>("/api/market/forex-monitoring-report");
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : "Failed to load forex monitoring report");
+  }
+}
+
+export async function fetchForexMonitoringHistory(days = 10) {
+  try {
+    return await getJson<ForexTradeMonitoringHistoryReport>(`/api/market/forex-monitoring-history?days=${days}`);
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : "Failed to load forex monitoring history");
+  }
+}
+
+export async function fetchMt4Snapshot() {
+  try {
+    return await getJson<Mt4SnapshotResponse>("/api/mt4/snapshot");
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : "Failed to load MT4 snapshot");
+  }
+}
+
+export async function fetchMt4Quotes() {
+  try {
+    return await getJson<Mt4QuoteFeedResponse>("/api/mt4/quotes");
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : "Failed to load MT4 quotes");
+  }
+}
+
+export async function postMt4Snapshot(snapshot: Mt4Snapshot) {
+  try {
+    const response = await requestWithFallback("/api/mt4/snapshot", {
+      method: "POST",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache, no-store, max-age=0",
+        Pragma: "no-cache"
+      },
+      body: JSON.stringify(snapshot)
+    });
+
+    return (await response.json()) as Mt4SnapshotResponse;
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : "Failed to send MT4 snapshot");
   }
 }
 

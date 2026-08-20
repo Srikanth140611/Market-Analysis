@@ -32,4 +32,4 @@ export const API_BASE_URL_CANDIDATES = Array.from(
 		].filter((value): value is string => Boolean(value))
 	)
 );
-export const REFRESH_INTERVAL_MS = 15_000;
+export const REFRESH_INTERVAL_MS = Platform.OS === "web" ? 30_000 : 15_000;

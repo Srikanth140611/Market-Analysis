@@ -1,21 +1,18 @@
 import { useState } from "react";
-import { Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
-import { fetchMarketAgents } from "../api/client";
-import { REFRESH_INTERVAL_MS } from "../constants";
+import { Linking, Platform, Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
+import { fetchMarketAgents, fetchMt4Quotes } from "../api/client";
+import { API_BASE_URL, REFRESH_INTERVAL_MS } from "../constants";
 import { usePollingData } from "../hooks/usePollingData";
 import { theme } from "../theme";
 import { SectionCard } from "../components/SectionCard";
-import { MarketAgentReport, MarketAgentTimeframeSignal } from "../types";
+import { MarketAgentReport, MarketAgentTimeframeSignal, Mt4Quote } from "../types";
 
 const TIMEFRAME_ORDER: Record<string, number> = {
-  "1minute": 1,
-  "5minute": 2,
-  "1hour": 3,
-  "4hour": 4,
-  "8hour": 5,
-  "12hour": 6,
-  "1Day": 7,
-  "1Week": 8
+  "1hour": 1,
+  "4hour": 2,
+  "12hour": 3,
+  "1Day": 4,
+  "1Week": 5
 };
 
 const AGENT_MENU = [
@@ -23,6 +20,7 @@ const AGENT_MENU = [
   { key: "commodities", label: "Commodities Analysis", match: "Commodities" },
   { key: "oil", label: "Oil Analysis", match: "Oil" }
 ] as const;
+const MT4_QUOTES_REFRESH_MS = Platform.OS === "web" ? 1_000 : 1_500;
 
 function sourceColor(source: string) {
   if (source === "live") {
@@ -56,6 +54,38 @@ function formatPrice(value: number) {
   return value > 20 ? value.toFixed(2) : value.toFixed(4);
 }
 
+function normalizeForexSymbol(symbol: string) {
+  return symbol.toUpperCase().replace(/[^A-Z]/g, "");
+}
+
+function findMt4Quote(symbol: string, quotesBySymbol: Map<string, Mt4Quote>) {
+  const normalized = normalizeForexSymbol(symbol);
+  const direct = quotesBySymbol.get(normalized);
+  if (direct) {
+    return direct;
+  }
+
+  for (const [key, quote] of quotesBySymbol.entries()) {
+    if (key.startsWith(normalized) || normalized.startsWith(key)) {
+      return quote;
+    }
+  }
+
+  return null;
+}
+
+function formatForexQuote(symbol: string, value: number) {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+
+  if (symbol.includes("JPY")) {
+    return value.toFixed(3);
+  }
+
+  return value.toFixed(5);
+}
+
 function formatSigned(value: number, decimals = 2) {
   const prefix = value > 0 ? "+" : "";
   return `${prefix}${value.toFixed(decimals)}`;
@@ -70,9 +100,34 @@ function formatTimestamp(timestamp: string) {
   });
 }
 
+function formatAestTimestamp(timestamp?: string) {
+  if (!timestamp) {
+    return "-";
+  }
+
+  try {
+    return new Date(timestamp).toLocaleString([], {
+      timeZone: "Australia/Sydney",
+      day: "2-digit",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    });
+  } catch {
+    return new Date(timestamp).toLocaleString();
+  }
+}
+
+function estimateBuyPrice(signal: MarketAgentTimeframeSignal) {
+  const spread = Math.max(0.00008, Math.min(0.00022, signal.currentPrice * 0.00012));
+  return signal.currentPrice + spread / 2;
+}
+
 function estimateSellPrice(signal: MarketAgentTimeframeSignal) {
-  const spreadRatio = Math.max(0.00005, Math.min(0.0025, signal.technicals.volatilityPercent / 100 / 8));
-  return signal.currentPrice * (1 - spreadRatio);
+  const spread = Math.max(0.00008, Math.min(0.00022, signal.currentPrice * 0.00012));
+  return signal.currentPrice - spread / 2;
 }
 
 function confidenceNarrative(signal: MarketAgentTimeframeSignal) {
@@ -129,13 +184,17 @@ function AgentCard({
   expandedSymbols,
   onToggleSymbol,
   selectedAnalysisKey,
-  onToggleAnalysis
+  onToggleAnalysis,
+  quotesBySymbol,
+  mt4QuotesFresh
 }: {
   agent: MarketAgentReport;
   expandedSymbols: Record<string, boolean>;
   onToggleSymbol: (key: string) => void;
   selectedAnalysisKey: string | null;
   onToggleAnalysis: (key: string) => void;
+  quotesBySymbol: Map<string, Mt4Quote>;
+  mt4QuotesFresh: boolean;
 }) {
   const isForexAgent = agent.agent === "Forex";
 
@@ -182,10 +241,15 @@ function AgentCard({
       {isForexAgent ? (
         <View style={styles.forexTableBlock}>
           <Text style={styles.forexTableTitle}>Forex Live Signals Agent</Text>
+          <Text style={styles.forexTableHint}>Risk-reward profile: minimum 1:2, dynamic up to 1:5</Text>
+          <Text style={styles.forexTableHint}>
+            Bid/Ask source: {mt4QuotesFresh ? "MT4 realtime feed" : "derived from market signal price"}
+          </Text>
           <View style={styles.forexTableHeaderRow}>
             <Text style={[styles.forexHeaderCell, styles.cellPair]}>Currency Pair</Text>
             <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Live Buy Price</Text>
             <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Live Sell Price</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellLiveTime]}>Live Time (AEST)</Text>
             <Text style={[styles.forexHeaderCell, styles.cellTimeframe]}>Time Frame</Text>
             <Text style={[styles.forexHeaderCell, styles.cellTrend]}>Trend</Text>
             <Text style={[styles.forexHeaderCell, styles.cellSignal]}>Signal</Text>
@@ -193,11 +257,15 @@ function AgentCard({
             <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Entry</Text>
             <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Stop loss</Text>
             <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Take profit</Text>
+            <Text style={[styles.forexHeaderCell, styles.cellRr]}>R:R</Text>
             <Text style={[styles.forexHeaderCell, styles.cellAnalysis]}>Analysis</Text>
           </View>
 
           {agent.symbols.map((symbol) => {
             const signal = symbol.bestSignal;
+            const mt4Quote = findMt4Quote(symbol.symbol, quotesBySymbol);
+            const liveBuy = mt4Quote?.ask ?? estimateBuyPrice(signal);
+            const liveSell = mt4Quote?.bid ?? estimateSellPrice(signal);
             const analysisKey = `${agent.agent}:${symbol.symbol}:${signal.timeframe}`;
             const analysisOpen = selectedAnalysisKey === analysisKey;
 
@@ -205,8 +273,9 @@ function AgentCard({
               <View key={symbol.symbol} style={styles.forexRowWrap}>
                 <View style={styles.forexTableRow}>
                   <Text style={[styles.forexCell, styles.cellPair]}>{symbol.symbol}</Text>
-                  <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(signal.currentPrice)}</Text>
-                  <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(estimateSellPrice(signal))}</Text>
+                  <Text style={[styles.forexCell, styles.cellPrice]}>{formatForexQuote(symbol.symbol, liveBuy)}</Text>
+                  <Text style={[styles.forexCell, styles.cellPrice]}>{formatForexQuote(symbol.symbol, liveSell)}</Text>
+                  <Text style={[styles.forexCell, styles.cellLiveTime]}>{formatAestTimestamp(mt4Quote?.timestamp)}</Text>
                   <Text style={[styles.forexCell, styles.cellTimeframe]}>{signal.timeframe}</Text>
                   <Text style={[styles.forexCell, styles.cellTrend, { color: directionColor(signal.direction) }]}>{signal.direction.toUpperCase()}</Text>
                   <Text style={[styles.forexCell, styles.cellSignal]}>{signal.pattern.toUpperCase()}</Text>
@@ -214,6 +283,7 @@ function AgentCard({
                   <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(signal.tradePlan.entry)}</Text>
                   <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(signal.tradePlan.stopLoss)}</Text>
                   <Text style={[styles.forexCell, styles.cellPrice]}>{formatPrice(signal.tradePlan.takeProfit)}</Text>
+                  <Text style={[styles.forexCell, styles.cellRr]}>1:{signal.tradePlan.riskRewardRatio.toFixed(2)}</Text>
                   <Pressable
                     style={[styles.analysisButton, analysisOpen ? styles.analysisButtonActive : null]}
                     onPress={() => onToggleAnalysis(analysisKey)}
@@ -299,21 +369,14 @@ function AgentCard({
         </View>
       )}
 
-      <View style={styles.placeholderRow}>
-        <Text style={styles.placeholderTitle}>RAG</Text>
-        <Text style={styles.placeholderText}>{agent.rag.context}</Text>
-        <Text style={styles.placeholderText}>Dimensions: {agent.deepDive.skillDimensions.join(" | ")}</Text>
-        <Text style={styles.placeholderText}>Fundamental focus: {agent.deepDive.fundamentalFocus.join(" | ")}</Text>
-        <Text style={styles.placeholderTitle}>Knowledge Graph</Text>
-        <Text style={styles.placeholderText}>Nodes: {agent.knowledgeGraph.nodes.join(", ")}</Text>
-        <Text style={styles.placeholderText}>Edges: {agent.knowledgeGraph.edges.join(" | ")}</Text>
-      </View>
+      <Text style={styles.minimizedContext}>RAG and knowledge graph context is condensed into the strategy and deep-dive panels above.</Text>
     </View>
   );
 }
 
 export function AgentsScreen() {
   const { data, loading, error } = usePollingData(fetchMarketAgents, REFRESH_INTERVAL_MS);
+  const mt4QuotesFeed = usePollingData(fetchMt4Quotes, MT4_QUOTES_REFRESH_MS);
   const { width } = useWindowDimensions();
   const [expandedSymbols, setExpandedSymbols] = useState<Record<string, boolean>>({});
   const [selectedAnalysisKey, setSelectedAnalysisKey] = useState<string | null>(null);
@@ -323,6 +386,11 @@ export function AgentsScreen() {
   const selectedMenu = AGENT_MENU.find((item) => item.key === selectedAgentKey) ?? AGENT_MENU[0];
   const selectedAgent = agents.find((agent) => agent.agent === selectedMenu.match) ?? agents[0] ?? null;
   const isCompactLayout = width < 900;
+  const mt4Quotes = mt4QuotesFeed.data?.quotes ?? [];
+  const mt4QuotesBySymbol = new Map(mt4Quotes.map((quote) => [normalizeForexSymbol(quote.symbol), quote] as const));
+  const mt4QuotesFresh = mt4QuotesFeed.data?.healthStatus === "fresh" && mt4Quotes.length > 0;
+  const monitoringReportLink = `${API_BASE_URL.replace(/\/$/, "")}/api/market/forex-monitoring-report?format=html`;
+  const monitoringHistoryLink = `${API_BASE_URL.replace(/\/$/, "")}/api/market/forex-monitoring-history?days=10&format=html`;
 
   const toggleSymbol = (key: string) => {
     setExpandedSymbols((previous) => ({
@@ -379,6 +447,8 @@ export function AgentsScreen() {
                   onToggleSymbol={toggleSymbol}
                   selectedAnalysisKey={selectedAnalysisKey}
                   onToggleAnalysis={toggleAnalysis}
+                  quotesBySymbol={mt4QuotesBySymbol}
+                  mt4QuotesFresh={mt4QuotesFresh}
                 />
               ) : (
                 <Text style={styles.muted}>No agent data available.</Text>
@@ -386,6 +456,20 @@ export function AgentsScreen() {
             </View>
           </View>
         ) : null}
+
+        <View style={styles.monitoringLinksWrap}>
+          <Text style={styles.monitoringLinksTitle}>Monitoring Links</Text>
+          <Pressable onPress={() => void Linking.openURL(monitoringReportLink)}>
+            <Text style={styles.monitoringLink} accessibilityRole="link">
+              Forex Trade Monitoring Report (HTML)
+            </Text>
+          </Pressable>
+          <Pressable onPress={() => void Linking.openURL(monitoringHistoryLink)}>
+            <Text style={styles.monitoringLink} accessibilityRole="link">
+              10-Day Forex Success Rate View (HTML)
+            </Text>
+          </Pressable>
+        </View>
       </SectionCard>
     </View>
   );
@@ -404,6 +488,24 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     fontSize: 12,
     fontWeight: "700"
+  },
+  monitoringLinksWrap: {
+    marginTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: "#1f4358",
+    paddingTop: 10
+  },
+  monitoringLinksTitle: {
+    color: theme.colors.accent,
+    fontSize: 12,
+    fontWeight: "800",
+    marginBottom: 6
+  },
+  monitoringLink: {
+    color: "#65b9ff",
+    fontSize: 12,
+    textDecorationLine: "underline",
+    marginBottom: 6
   },
   agentLayout: {
     flexDirection: "row",
@@ -506,6 +608,26 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "700"
   },
+  placeholderRow: {
+    marginTop: 10,
+    padding: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#1f4358",
+    backgroundColor: "#0b1d29",
+    gap: 4
+  },
+  placeholderTitle: {
+    color: theme.colors.accent,
+    fontSize: 12,
+    fontWeight: "800",
+    marginTop: 4
+  },
+  placeholderText: {
+    color: theme.colors.muted,
+    fontSize: 11,
+    lineHeight: 15
+  },
   symbolBlock: {
     marginTop: 10,
     gap: 8
@@ -584,6 +706,9 @@ const styles = StyleSheet.create({
   cellPrice: {
     flex: 1.3
   },
+  cellLiveTime: {
+    flex: 1.8
+  },
   cellTimeframe: {
     flex: 1.1
   },
@@ -595,8 +720,17 @@ const styles = StyleSheet.create({
     flex: 0.9,
     fontWeight: "700"
   },
+  forexTableHint: {
+    color: theme.colors.muted,
+    fontSize: 11,
+    marginBottom: 8
+  },
   cellConfidence: {
     flex: 0.9,
+    fontWeight: "700"
+  },
+  cellRr: {
+    flex: 0.85,
     fontWeight: "700"
   },
   cellAnalysis: {
@@ -671,25 +805,12 @@ const styles = StyleSheet.create({
   toggleTextActive: {
     color: "#03222f"
   },
-  placeholderRow: {
+  minimizedContext: {
     marginTop: 10,
-    backgroundColor: "#0b1d29",
-    borderRadius: 12,
-    padding: 10,
-    borderWidth: 1,
-    borderColor: "#17384b"
-  },
-  placeholderTitle: {
-    color: theme.colors.accent,
-    fontWeight: "800",
-    marginTop: 2,
-    marginBottom: 3
-  },
-  placeholderText: {
     color: theme.colors.muted,
     fontSize: 12,
     lineHeight: 16,
-    marginBottom: 2
+    paddingHorizontal: 4
   },
   signalCard: {
     backgroundColor: "#102b3b",

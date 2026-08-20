@@ -148,3 +148,40 @@ If you share your Figma frame specs (spacing, typography, colors, component stat
 - Slack notifications require `SLACK_WEBHOOK_URL`.
 - Automatic Slack news broadcasts are deduplicated by news ID and only trigger for newly detected headlines after startup.
 - This implementation is a production-ready starter and can be extended with broker integrations, watchlists, and user auth.
+
+## MT4 Demo Integration
+
+The repo now includes a minimal MT4 EA/WebRequest bridge in [scripts/mt4-demo-snapshot-ea.mq4](scripts/mt4-demo-snapshot-ea.mq4). It posts demo account snapshots to `POST /api/mt4/snapshot` and the API stores the latest payload in memory for the app to read back from `GET /api/mt4/snapshot`.
+
+If you are using MT5 instead of MT4, compile [scripts/mt5-demo-snapshot-ea.mq5](scripts/mt5-demo-snapshot-ea.mq5) in MetaEditor. The MT5 version exposes the same inputs and posts the same snapshot payload format.
+
+Before running the EA, add the API URL to MT4 allowed WebRequest URLs: `Tools -> Options -> Expert Advisors -> Allow WebRequest for listed URL`.
+
+In MT5, do the same under `Tools -> Options -> Expert Advisors`, then attach the compiled EA from the Navigator panel and open the `Inputs` tab.
+
+Payload fields sent by the EA:
+- `accountId`, `terminalId`, `server`, `timestamp`
+- `heartbeat` (monotonic counter incremented on each snapshot)
+- `balance`, `equity`, `margin`, `freeMargin`
+- `positions[]`, `pendingOrders[]`, `quotes[]`
+
+EA defaults now target low-latency sync:
+- `TimerSeconds = 1` (pushes once per second by default)
+
+Production hardening options now supported:
+- Set `MT4_SNAPSHOT_API_KEY` to require `x-api-key` on `POST /api/mt4/snapshot`.
+- Set `MT4_SNAPSHOT_TABLE` to persist snapshots in DynamoDB on the Lambda mirror.
+- Optional Dynamo key configuration: `MT4_SNAPSHOT_PK_NAME` (default `snapshotKey`) and `MT4_SNAPSHOT_KEY` (default `latest`).
+
+Suggested DynamoDB table schema:
+- Partition key name: `snapshotKey` (String)
+- Example key value used by this app: `latest`
+
+If `MT4_SNAPSHOT_API_KEY` is enabled, fill the EA `ApiKey` input so WebRequest includes the required header.
+
+If you use the MT5 EA, the same `ApiKey` input applies.
+
+If you do not want auth at all:
+- Remove `MT4_SNAPSHOT_API_KEY` from the Lambda environment.
+- Redeploy the Lambda.
+- Leave the EA `ApiKey` input blank.

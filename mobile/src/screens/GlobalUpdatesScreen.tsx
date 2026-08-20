@@ -1052,7 +1052,7 @@ export function GlobalUpdatesScreen() {
     <View>
       <SectionCard
         title="Global Market Updates"
-        subtitle="Auto-refreshes every 15s for latest decision-ready headlines"
+        subtitle="Auto-refreshes every 30s on web for stability and rate-limit protection"
       >
         {loading ? <Text style={styles.muted}>Loading news...</Text> : null}
         {error ? <Text style={styles.error}>{error}</Text> : null}

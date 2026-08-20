@@ -104,6 +104,61 @@ export type MarketAgentsResponse = {
   generatedAt: string;
 };
 
+export type ForexTradeMonitoringStatus = "tp-hit" | "sl-hit" | "open";
+
+export type ForexTradeMonitoringItem = {
+  tradeId: string;
+  symbol: string;
+  timeframe: MarketAgentAnalysisTimeframe;
+  direction: "up" | "down" | "neutral";
+  entry: number;
+  stopLoss: number;
+  takeProfit: number;
+  currentPrice: number;
+  riskRewardRatio: number;
+  status: ForexTradeMonitoringStatus;
+  openedAt: string;
+  closedAt?: string;
+  closePrice?: number;
+};
+
+export type ForexTradeMonitoringReport = {
+  totalTrades: number;
+  tpHitCount: number;
+  slHitCount: number;
+  openCount: number;
+  closedTrades: number;
+  activeTrades: number;
+  resolvedTrades: number;
+  winRatePercent: number;
+  generatedAt: string;
+  items: ForexTradeMonitoringItem[];
+};
+
+export type ForexTradeMonitoringDailySnapshot = {
+  date: string;
+  openedTrades: number;
+  totalTrades: number;
+  tpHitCount: number;
+  slHitCount: number;
+  openCount: number;
+  resolvedTrades: number;
+  winRatePercent: number | null;
+  hasData: boolean;
+  generatedAt: string;
+};
+
+export type ForexTradeMonitoringHistoryReport = {
+  daysRequested: number;
+  observedDays: number;
+  totalTpHitCount: number;
+  totalSlHitCount: number;
+  totalResolvedTrades: number;
+  overallWinRatePercent: number | null;
+  generatedAt: string;
+  daily: ForexTradeMonitoringDailySnapshot[];
+};
+
 const AGENT_CONFIG: Array<{
   agent: MarketAgentName;
   category: MarketAssetCategory;
@@ -149,18 +204,17 @@ const AGENT_CONFIG: Array<{
   }
 ];
 
-const ANALYSIS_TIMEFRAMES: MarketAgentAnalysisTimeframe[] = ["1minute", "5minute", "1hour", "4hour", "8hour", "12hour", "1Day", "1Week"];
+const ANALYSIS_TIMEFRAMES: MarketAgentAnalysisTimeframe[] = ["1hour", "4hour", "12hour", "1Day", "1Week"];
 
 const TIMEFRAME_WEIGHTS: Record<MarketAgentAnalysisTimeframe, number> = {
-  "1minute": 8,
-  "5minute": 7,
-  "1hour": 6,
-  "4hour": 5,
-  "8hour": 4,
+  "1hour": 5,
+  "4hour": 4,
   "12hour": 3,
   "1Day": 2,
   "1Week": 1
 };
+
+const forexTradeLedger = new Map<string, ForexTradeMonitoringItem>();
 
 function formatTimestamp(timestamp: number) {
   return new Date(timestamp).toISOString();
@@ -173,6 +227,86 @@ function clamp(value: number, min: number, max: number) {
 function roundTo(value: number, decimals = 4) {
   const factor = 10 ** decimals;
   return Math.round(value * factor) / factor;
+}
+
+function toUtcDayKey(timestamp: string) {
+  return new Date(timestamp).toISOString().slice(0, 10);
+}
+
+function buildSimulatedTradeId(symbol: string, signal: MarketAgentTimeframeSignal) {
+  return [
+    symbol,
+    signal.timeframe,
+    signal.direction,
+    toUtcDayKey(signal.lastOccurrenceAt)
+  ].join(":");
+}
+
+function normalizeTradeLedger() {
+  const normalized = new Map<string, ForexTradeMonitoringItem>();
+
+  for (const trade of forexTradeLedger.values()) {
+    const normalizedId = [
+      trade.symbol,
+      trade.timeframe,
+      trade.direction,
+      toUtcDayKey(trade.openedAt)
+    ].join(":");
+
+    const existing = normalized.get(normalizedId);
+    if (!existing) {
+      normalized.set(normalizedId, {
+        ...trade,
+        tradeId: normalizedId
+      });
+      continue;
+    }
+
+    const existingTime = new Date(existing.openedAt).getTime();
+    const candidateTime = new Date(trade.openedAt).getTime();
+    if (candidateTime >= existingTime) {
+      normalized.set(normalizedId, {
+        ...trade,
+        tradeId: normalizedId
+      });
+    }
+  }
+
+  forexTradeLedger.clear();
+  for (const [tradeId, trade] of normalized.entries()) {
+    forexTradeLedger.set(tradeId, trade);
+  }
+}
+
+function resolveForexRewardMultiplier(timeframe: MarketAgentAnalysisTimeframe, pattern: MarketPatternKind, confidence: number) {
+  const patternBase = (() => {
+    switch (pattern) {
+      case "breakout":
+        return 3.5;
+      case "trend":
+        return 3.0;
+      case "momentum":
+        return 2.8;
+      case "compression":
+        return 2.5;
+      case "reversal":
+        return 2.3;
+      case "range":
+      default:
+        return 2.0;
+    }
+  })();
+
+  const confidenceBonus = confidence >= 80 ? 1.0 : confidence >= 70 ? 0.6 : confidence >= 60 ? 0.3 : 0;
+  const timeframeBonus: Record<MarketAgentAnalysisTimeframe, number> = {
+    "1hour": 0,
+    "4hour": 0.2,
+    "12hour": 0.5,
+    "1Day": 0.9,
+    "1Week": 1.3
+  };
+
+  return clamp(patternBase + confidenceBonus + timeframeBonus[timeframe], 2, 5);
 }
 
 function ema(values: number[], period: number) {
@@ -275,10 +409,65 @@ function strategiesForPattern(pattern: MarketPatternKind, direction: "up" | "dow
   return [...baseStrategies, ...forexLayer];
 }
 
-function buildTradePlan(price: number, support: number, resistance: number, direction: "up" | "down" | "neutral", pattern: MarketPatternKind, confidence: number): MarketAgentTradePlan {
+function buildTradePlan(price: number, support: number, resistance: number, direction: "up" | "down" | "neutral", pattern: MarketPatternKind, confidence: number, timeframe: MarketAgentAnalysisTimeframe, marketCategory?: MarketAssetCategory): MarketAgentTradePlan {
+  const isForex = marketCategory === "forex";
   const range = Math.max(resistance - support, price * 0.0025);
-  const trailPercent = clamp(0.008 + (100 - confidence) / 2000, 0.004, 0.025);
-  const rewardMultiplier = pattern === "breakout" || pattern === "trend" ? 2.2 : pattern === "compression" ? 2.5 : 1.8;
+  const trailPercent = isForex ? 0.0015 : clamp(0.008 + (100 - confidence) / 2000, 0.004, 0.025);
+  const rewardMultiplier = isForex
+    ? resolveForexRewardMultiplier(timeframe, pattern, confidence)
+    : pattern === "breakout" || pattern === "trend"
+      ? 2.2
+      : pattern === "compression"
+        ? 2.5
+        : 1.8;
+
+  if (isForex) {
+    const stopDistance = clamp(price * 0.0012, 0.0008, price * 0.003);
+    const profitDistance = stopDistance * rewardMultiplier;
+
+    if (direction === "up") {
+      const entry = price;
+      const stopLoss = entry - stopDistance;
+      const takeProfit = entry + profitDistance;
+      const trailingStopLoss = entry - stopDistance * 0.6;
+      return {
+        entry: roundTo(entry),
+        stopLoss: roundTo(stopLoss),
+        takeProfit: roundTo(takeProfit),
+        trailingStopLoss: roundTo(trailingStopLoss),
+        trailingStopPercent: roundTo((stopDistance / entry) * 100, 2),
+        riskRewardRatio: roundTo((takeProfit - entry) / Math.max(entry - stopLoss, 0.0000001), 2)
+      };
+    }
+
+    if (direction === "down") {
+      const entry = price;
+      const stopLoss = entry + stopDistance;
+      const takeProfit = entry - profitDistance;
+      const trailingStopLoss = entry + stopDistance * 0.6;
+      return {
+        entry: roundTo(entry),
+        stopLoss: roundTo(stopLoss),
+        takeProfit: roundTo(takeProfit),
+        trailingStopLoss: roundTo(trailingStopLoss),
+        trailingStopPercent: roundTo((stopDistance / entry) * 100, 2),
+        riskRewardRatio: roundTo((entry - takeProfit) / Math.max(stopLoss - entry, 0.0000001), 2)
+      };
+    }
+
+    const entry = price;
+    const stopLoss = entry - stopDistance;
+    const takeProfit = entry + stopDistance * rewardMultiplier;
+    const trailingStopLoss = entry - stopDistance * 0.6;
+    return {
+      entry: roundTo(entry),
+      stopLoss: roundTo(stopLoss),
+      takeProfit: roundTo(takeProfit),
+      trailingStopLoss: roundTo(trailingStopLoss),
+      trailingStopPercent: roundTo((stopDistance / entry) * 100, 2),
+      riskRewardRatio: roundTo((takeProfit - entry) / Math.max(entry - stopLoss, 0.0000001), 2)
+    };
+  }
 
   if (direction === "up") {
     const entry = price;
@@ -495,7 +684,7 @@ function buildSignal(
   const lastOccurrenceAt = latestCandle ? formatTimestamp(latestCandle.t > 1e12 ? latestCandle.t : latestCandle.t * 1000) : new Date().toISOString();
   const confidence = Math.round(pattern.confidence);
   const strategiesApplied = strategiesForPattern(pattern.pattern, pattern.direction, category, symbol);
-  const tradePlan = buildTradePlan(currentPrice, pattern.support, pattern.resistance, pattern.direction, pattern.pattern, confidence);
+  const tradePlan = buildTradePlan(currentPrice, pattern.support, pattern.resistance, pattern.direction, pattern.pattern, confidence, timeframe, category);
   const technicals = buildTechnicalAnalysis(symbol, timeframe, candles, pattern.support, pattern.resistance);
   const fundamentals = buildFundamentalAnalysis(category, symbol, pattern.direction);
   const deepDive = buildDeepDiveDimension(technicals, fundamentals, pattern, strategiesApplied);
@@ -638,5 +827,245 @@ export async function getMarketAgentsAnalysis(): Promise<MarketAgentsResponse> {
     source,
     reason: "Three analysis agents built from live/derived price history with technical indicators, macro drivers, strategy plans, and graph placeholders.",
     generatedAt
+  };
+}
+
+function evaluateTradeStatusByLevels(direction: "up" | "down" | "neutral", stopLoss: number, takeProfit: number, currentPrice: number): ForexTradeMonitoringStatus {
+  if (direction === "up") {
+    if (currentPrice >= takeProfit) {
+      return "tp-hit";
+    }
+
+    if (currentPrice <= stopLoss) {
+      return "sl-hit";
+    }
+
+    return "open";
+  }
+
+  if (direction === "down") {
+    if (currentPrice <= takeProfit) {
+      return "tp-hit";
+    }
+
+    if (currentPrice >= stopLoss) {
+      return "sl-hit";
+    }
+
+    return "open";
+  }
+
+  return "open";
+}
+
+function trimTradeLedger(maxEntries = 1200) {
+  if (forexTradeLedger.size <= maxEntries) {
+    return;
+  }
+
+  const ordered = Array.from(forexTradeLedger.values()).sort((left, right) => {
+    return new Date(left.openedAt).getTime() - new Date(right.openedAt).getTime();
+  });
+
+  while (ordered.length > maxEntries) {
+    const oldest = ordered.shift();
+    if (oldest) {
+      forexTradeLedger.delete(oldest.tradeId);
+    }
+  }
+}
+
+function upsertSimulatedTradesFromForexAgent(forex: MarketAgentReport, generatedAt: string) {
+  normalizeTradeLedger();
+
+  for (const symbolReport of forex.symbols) {
+    for (const signal of symbolReport.timeframeSignals) {
+      if (signal.direction === "neutral") {
+        continue;
+      }
+
+      const tradeId = buildSimulatedTradeId(symbolReport.symbol, signal);
+      const existing = forexTradeLedger.get(tradeId);
+
+      if (!existing) {
+        const openedAt = Number.isFinite(Date.parse(signal.lastOccurrenceAt)) ? signal.lastOccurrenceAt : generatedAt;
+        forexTradeLedger.set(tradeId, {
+          tradeId,
+          symbol: symbolReport.symbol,
+          timeframe: signal.timeframe,
+          direction: signal.direction,
+          entry: signal.tradePlan.entry,
+          stopLoss: signal.tradePlan.stopLoss,
+          takeProfit: signal.tradePlan.takeProfit,
+          currentPrice: symbolReport.currentPrice,
+          riskRewardRatio: signal.tradePlan.riskRewardRatio,
+          status: "open",
+          openedAt
+        });
+      }
+    }
+  }
+
+  trimTradeLedger();
+}
+
+function updateOpenTradesWithCurrentPrices(forex: MarketAgentReport, generatedAt: string) {
+  const priceBySymbol = new Map<string, number>();
+  for (const symbolReport of forex.symbols) {
+    priceBySymbol.set(symbolReport.symbol, symbolReport.currentPrice);
+  }
+
+  for (const [tradeId, trade] of forexTradeLedger.entries()) {
+    if (trade.status !== "open") {
+      continue;
+    }
+
+    const price = priceBySymbol.get(trade.symbol);
+    if (typeof price !== "number" || !Number.isFinite(price)) {
+      continue;
+    }
+
+    const currentPrice = price;
+    const status = evaluateTradeStatusByLevels(trade.direction, trade.stopLoss, trade.takeProfit, currentPrice);
+    if (status === "open") {
+      if (trade.currentPrice !== currentPrice) {
+        forexTradeLedger.set(tradeId, {
+          ...trade,
+          currentPrice
+        });
+      }
+      continue;
+    }
+
+    forexTradeLedger.set(tradeId, {
+      ...trade,
+      status,
+      currentPrice,
+      closePrice: currentPrice,
+      closedAt: generatedAt
+    });
+  }
+}
+
+export async function getForexTradeMonitoringReport(): Promise<ForexTradeMonitoringReport> {
+  const agents = await getMarketAgentsAnalysis();
+  const forex = agents.data.find((agent) => agent.agent === "Forex");
+  const generatedAt = new Date().toISOString();
+
+  if (!forex) {
+    return {
+      totalTrades: 0,
+      tpHitCount: 0,
+      slHitCount: 0,
+      openCount: 0,
+      closedTrades: 0,
+      activeTrades: 0,
+      resolvedTrades: 0,
+      winRatePercent: 0,
+      generatedAt,
+      items: []
+    };
+  }
+
+  upsertSimulatedTradesFromForexAgent(forex, generatedAt);
+  updateOpenTradesWithCurrentPrices(forex, generatedAt);
+
+  const items = Array.from(forexTradeLedger.values()).sort((left, right) => {
+    return new Date(right.openedAt).getTime() - new Date(left.openedAt).getTime();
+  });
+
+  const tpHitCount = items.filter((item) => item.status === "tp-hit").length;
+  const slHitCount = items.filter((item) => item.status === "sl-hit").length;
+  const openCount = items.filter((item) => item.status === "open").length;
+  const closedTrades = tpHitCount + slHitCount;
+  const resolvedTrades = tpHitCount + slHitCount;
+  const winRatePercent = resolvedTrades > 0 ? roundTo((tpHitCount / resolvedTrades) * 100, 2) : 0;
+
+  return {
+    totalTrades: items.length,
+    tpHitCount,
+    slHitCount,
+    openCount,
+    closedTrades,
+    activeTrades: openCount,
+    resolvedTrades,
+    winRatePercent,
+    generatedAt,
+    items
+  };
+}
+
+function buildHistoryDateRange(daysRequested: number) {
+  const end = new Date();
+  const days: string[] = [];
+
+  for (let index = daysRequested - 1; index >= 0; index -= 1) {
+    const current = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate()));
+    current.setUTCDate(current.getUTCDate() - index);
+    days.push(current.toISOString().slice(0, 10));
+  }
+
+  return days;
+}
+
+export async function getForexTradeMonitoringHistoryReport(days = 10): Promise<ForexTradeMonitoringHistoryReport> {
+  const daysRequested = clamp(Math.round(days), 1, 30);
+
+  // Refresh/open simulated trades before building rolling history.
+  await getForexTradeMonitoringReport();
+
+  const dayKeys = buildHistoryDateRange(daysRequested);
+  const daily = dayKeys.map((dayKey): ForexTradeMonitoringDailySnapshot => {
+    const openedTrades = Array.from(forexTradeLedger.values()).filter((item) => toUtcDayKey(item.openedAt) === dayKey).length;
+    const tpHitCount = Array.from(forexTradeLedger.values()).filter((item) => item.status === "tp-hit" && item.closedAt && toUtcDayKey(item.closedAt) === dayKey).length;
+    const slHitCount = Array.from(forexTradeLedger.values()).filter((item) => item.status === "sl-hit" && item.closedAt && toUtcDayKey(item.closedAt) === dayKey).length;
+    const openCount = Array.from(forexTradeLedger.values()).filter((item) => item.status === "open" && toUtcDayKey(item.openedAt) === dayKey).length;
+    const resolvedTrades = tpHitCount + slHitCount;
+    const hasData = openedTrades > 0 || resolvedTrades > 0;
+
+    if (hasData) {
+      return {
+        date: dayKey,
+        openedTrades,
+        totalTrades: openedTrades,
+        tpHitCount,
+        slHitCount,
+        openCount,
+        resolvedTrades,
+        winRatePercent: resolvedTrades > 0 ? roundTo((tpHitCount / resolvedTrades) * 100, 2) : null,
+        hasData,
+        generatedAt: new Date().toISOString()
+      };
+    }
+
+    return {
+      date: dayKey,
+      openedTrades: 0,
+      totalTrades: 0,
+      tpHitCount: 0,
+      slHitCount: 0,
+      openCount: 0,
+      resolvedTrades: 0,
+      winRatePercent: null,
+      hasData: false,
+      generatedAt: new Date(`${dayKey}T00:00:00.000Z`).toISOString()
+    };
+  });
+
+  const observedDays = daily.filter((item) => item.hasData).length;
+  const totalTpHitCount = daily.reduce((sum, item) => sum + item.tpHitCount, 0);
+  const totalSlHitCount = daily.reduce((sum, item) => sum + item.slHitCount, 0);
+  const totalResolvedTrades = totalTpHitCount + totalSlHitCount;
+  const overallWinRatePercent = totalResolvedTrades > 0 ? roundTo((totalTpHitCount / totalResolvedTrades) * 100, 2) : null;
+
+  return {
+    daysRequested,
+    observedDays,
+    totalTpHitCount,
+    totalSlHitCount,
+    totalResolvedTrades,
+    overallWinRatePercent,
+    generatedAt: new Date().toISOString(),
+    daily
   };
 }

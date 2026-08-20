@@ -50,6 +50,7 @@ export type StockSuggestion = {
   name: string;
   price: number;
   changePercent: number;
+  source?: "live" | "fallback";
   rationale: string;
   sector?: string;
   score?: number;
@@ -105,7 +106,7 @@ export type ForexCandlesResponse = {
   years: number;
 };
 
-export type MarketHistoryTimeframe = "1minute" | "5minute" | "1hour" | "4hour" | "8hour" | "12hour" | "1Day" | "1Week";
+export type MarketHistoryTimeframe = "1hour" | "4hour" | "12hour" | "1Day" | "1Week";
 
 export type MarketHistorySource = "live" | "derived" | "fallback" | "mixed";
 
@@ -239,4 +240,120 @@ export type MarketAgentsResponse = {
   source: MarketHistorySource;
   reason?: string;
   generatedAt: string;
+};
+
+export type ForexTradeMonitoringStatus = "tp-hit" | "sl-hit" | "open";
+
+export type ForexTradeMonitoringItem = {
+  tradeId: string;
+  symbol: string;
+  timeframe: MarketHistoryTimeframe;
+  direction: "up" | "down" | "neutral";
+  entry: number;
+  stopLoss: number;
+  takeProfit: number;
+  currentPrice: number;
+  riskRewardRatio: number;
+  status: ForexTradeMonitoringStatus;
+  openedAt: string;
+  closedAt?: string;
+  closePrice?: number;
+};
+
+export type ForexTradeMonitoringReport = {
+  totalTrades: number;
+  tpHitCount: number;
+  slHitCount: number;
+  openCount: number;
+  closedTrades: number;
+  activeTrades: number;
+  resolvedTrades: number;
+  winRatePercent: number;
+  generatedAt: string;
+  items: ForexTradeMonitoringItem[];
+};
+
+export type ForexTradeMonitoringDailySnapshot = {
+  date: string;
+  openedTrades: number;
+  totalTrades: number;
+  tpHitCount: number;
+  slHitCount: number;
+  openCount: number;
+  resolvedTrades: number;
+  winRatePercent: number | null;
+  hasData: boolean;
+  generatedAt: string;
+};
+
+export type ForexTradeMonitoringHistoryReport = {
+  daysRequested: number;
+  observedDays: number;
+  totalTpHitCount: number;
+  totalSlHitCount: number;
+  totalResolvedTrades: number;
+  overallWinRatePercent: number | null;
+  generatedAt: string;
+  daily: ForexTradeMonitoringDailySnapshot[];
+};
+
+export type Mt4Position = {
+  symbol: string;
+  side: "BUY" | "SELL";
+  volume: number;
+  openPrice: number;
+  profit: number;
+  stopLoss?: number;
+  takeProfit?: number;
+};
+
+export type Mt4PendingOrder = {
+  symbol: string;
+  type: "BUY_LIMIT" | "BUY_STOP" | "SELL_LIMIT" | "SELL_STOP";
+  price: number;
+  volume: number;
+  stopLoss?: number;
+  takeProfit?: number;
+};
+
+export type Mt4Quote = {
+  symbol: string;
+  bid: number;
+  ask: number;
+  spread?: number;
+  timestamp: string;
+};
+
+export type Mt4Snapshot = {
+  accountId: string;
+  terminalId: string;
+  server?: string;
+  timestamp: string;
+  heartbeat?: number;
+  balance?: number;
+  equity?: number;
+  margin?: number;
+  freeMargin?: number;
+  positions?: Mt4Position[];
+  pendingOrders?: Mt4PendingOrder[];
+  quotes?: Mt4Quote[];
+};
+
+export type Mt4SnapshotResponse = Mt4Snapshot & {
+  source: "mt4";
+  receivedAt: string;
+  ageSeconds: number;
+  healthStatus: "fresh" | "stale" | "offline";
+  healthNote: string;
+};
+
+export type Mt4QuoteFeedResponse = {
+  source: "mt4";
+  receivedAt: string;
+  timestamp: string;
+  heartbeat?: number;
+  ageSeconds: number;
+  healthStatus: "fresh" | "stale" | "offline";
+  healthNote: string;
+  quotes: Mt4Quote[];
 };

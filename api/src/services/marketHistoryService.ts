@@ -1,7 +1,7 @@
 import { getForexCandles, type ForexTimeframe, type OhlcCandle } from "./marketService.js";
 
 export type MarketAssetCategory = "forex" | "commodity" | "oil";
-export type HistoryTimeframe = "1minute" | "5minute" | "1hour" | "4hour" | "8hour" | "12hour" | "1Day" | "1Week";
+export type HistoryTimeframe = "1hour" | "4hour" | "12hour" | "1Day" | "1Week";
 export type HistorySource = "live" | "derived" | "fallback";
 export type PatternKind = "trend" | "range" | "breakout" | "reversal" | "momentum" | "compression";
 export type PatternDirection = "up" | "down" | "neutral";
@@ -45,7 +45,7 @@ type HistorySymbol = {
   forexPair?: string;
 };
 
-const SUPPORTED_TIMEFRAMES: HistoryTimeframe[] = ["1minute", "5minute", "1hour", "4hour", "8hour", "12hour", "1Day", "1Week"];
+const SUPPORTED_TIMEFRAMES: HistoryTimeframe[] = ["1hour", "4hour", "12hour", "1Day", "1Week"];
 
 const HISTORY_SYMBOLS: HistorySymbol[] = [
   { symbol: "AUD/USD", name: "Australian Dollar vs US Dollar", category: "forex", yahooCode: "AUDUSD=X", forexPair: "AUD/USD" },
@@ -131,16 +131,10 @@ function compressCandles(candles: OhlcCandle[], targetCount: number) {
 
 function timeframeToTargetCount(timeframe: HistoryTimeframe) {
   switch (timeframe) {
-    case "1minute":
-      return 360;
-    case "5minute":
-      return 320;
     case "1hour":
       return 280;
     case "4hour":
       return 220;
-    case "8hour":
-      return 180;
     case "12hour":
       return 160;
     case "1Day":
@@ -154,16 +148,10 @@ function timeframeToTargetCount(timeframe: HistoryTimeframe) {
 
 function timeframeLabel(timeframe: HistoryTimeframe) {
   switch (timeframe) {
-    case "1minute":
-      return "1 minute";
-    case "5minute":
-      return "5 minute";
     case "1hour":
       return "1 hour";
     case "4hour":
       return "4 hour";
-    case "8hour":
-      return "8 hour";
     case "12hour":
       return "12 hour";
     case "1Day":
@@ -393,17 +381,6 @@ function classifyPattern(symbol: HistorySymbol, timeframe: HistoryTimeframe, can
 }
 
 async function fetchForexHistory(pair: string, timeframe: HistoryTimeframe, years: number): Promise<HistorySeriesFrame> {
-  if (timeframe === "8hour") {
-    const base = await getForexCandles([pair], "1hour" as ForexTimeframe, years);
-    const source: HistorySource = base.source === "live" ? "live" : "fallback";
-    const raw = base.data[pair] ?? [];
-    return {
-      candles: compressCandles(aggregateCandles(raw, 8), timeframeToTargetCount(timeframe)),
-      source,
-      note: source === "live" ? "Live forex candles aggregated to 8-hour bars" : base.reason ?? "Fallback forex candles"
-    };
-  }
-
   if (timeframe === "12hour") {
     const base = await getForexCandles([pair], "1hour" as ForexTimeframe, years);
     const source: HistorySource = base.source === "live" ? "live" : "fallback";
@@ -464,7 +441,7 @@ async function fetchCommodityOrOilHistory(symbol: HistorySymbol, timeframe: Hist
   return {
     candles: compressCandles(daily, timeframeToTargetCount(timeframe)),
     source: "derived",
-    note: `${symbol.symbol} does not expose public 1 minute to 8 hour history here; using derived bars from Yahoo daily history`
+    note: `${symbol.symbol} does not expose public intraday history here; using derived bars from Yahoo daily history`
   };
 }
 

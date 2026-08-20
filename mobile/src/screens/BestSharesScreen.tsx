@@ -66,7 +66,12 @@ export function BestSharesScreen() {
           <View key={item.symbol} style={styles.row}>
             <View style={styles.rowTop}>
               <Text style={styles.symbol}>{item.symbol}</Text>
-              <Text style={styles.change}>{item.changePercent.toFixed(2)}%</Text>
+              <View style={styles.rowTopRight}>
+                <Text style={[styles.sourceBadge, item.source === "fallback" ? styles.sourceFallback : styles.sourceLive]}>
+                  {(item.source ?? "live").toUpperCase()}
+                </Text>
+                <Text style={styles.change}>{item.changePercent.toFixed(2)}%</Text>
+              </View>
             </View>
             <Text style={styles.name}>{item.name}</Text>
             {typeof item.score === "number" ? (
@@ -128,6 +133,27 @@ const styles = StyleSheet.create({
   rowTop: {
     flexDirection: "row",
     justifyContent: "space-between"
+  },
+  rowTopRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  sourceBadge: {
+    fontSize: 10,
+    fontWeight: "800",
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 999,
+    overflow: "hidden"
+  },
+  sourceLive: {
+    color: "#0e2f20",
+    backgroundColor: "#63e2a5"
+  },
+  sourceFallback: {
+    color: "#3c2a07",
+    backgroundColor: "#ffd166"
   },
   symbol: {
     color: theme.colors.text,

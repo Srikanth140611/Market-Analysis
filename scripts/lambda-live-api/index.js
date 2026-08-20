@@ -4,6 +4,33 @@ const RSS_FEEDS = [
 ];
 
 const STRICT_LIVE_MODE = true;
+const MT4_SNAPSHOT_API_KEY = process.env.MT4_SNAPSHOT_API_KEY || "";
+const MT4_SNAPSHOT_TABLE = process.env.MT4_SNAPSHOT_TABLE || "";
+const MT4_SNAPSHOT_PK_NAME = process.env.MT4_SNAPSHOT_PK_NAME || "snapshotKey";
+const MT4_SNAPSHOT_KEY = process.env.MT4_SNAPSHOT_KEY || "latest";
+let dynamoClient = null;
+let DynamoGetCommand = null;
+let DynamoPutCommand = null;
+const FOREX_MONITORING_TRADES_PK = "forex-monitoring-trades";
+const FOREX_MONITORING_TRADES_SK = "ledger";
+const forexTradeLedger = new Map();
+
+if (MT4_SNAPSHOT_TABLE) {
+  try {
+    const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+    const { DynamoDBDocumentClient, GetCommand, PutCommand } = require("@aws-sdk/lib-dynamodb");
+    dynamoClient = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+      marshallOptions: {
+        removeUndefinedValues: true
+      }
+    });
+    DynamoGetCommand = GetCommand;
+    DynamoPutCommand = PutCommand;
+  } catch {
+    // Keep Lambda functional even if dependencies are not bundled.
+    dynamoClient = null;
+  }
+}
 
 const HISTORY_SYMBOLS = {
   "AUD/USD": { symbol: "AUD/USD", name: "Australian Dollar vs US Dollar", category: "forex", yahooCode: "AUDUSD=X" },
@@ -30,7 +57,7 @@ const HISTORY_SYMBOLS = {
   WTI: { symbol: "WTI", name: "Crude Oil WTI", category: "oil", yahooCode: "CL=F" }
 };
 
-const HISTORY_TIMEFRAMES = ["1minute", "5minute", "1hour", "4hour", "8hour", "12hour", "1Day", "1Week"];
+const HISTORY_TIMEFRAMES = ["1hour", "4hour", "12hour", "1Day", "1Week"];
 const DEFAULT_REFERENCE_PRICES = {
   "AUD/USD": 0.66,
   "EUR/USD": 1.09,
@@ -62,6 +89,10 @@ function isFiniteNumberArray(values) {
 
 function jsonStep(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function toUtcDayKey(timestamp) {
+  return new Date(timestamp).toISOString().slice(0, 10);
 }
 
 function aggregateCandles(candles, bucket) {
@@ -114,16 +145,10 @@ function compressCandles(candles, targetCount) {
 
 function timeframeToTargetCount(timeframe) {
   switch (timeframe) {
-    case "1minute":
-      return 360;
-    case "5minute":
-      return 320;
     case "1hour":
       return 280;
     case "4hour":
       return 220;
-    case "8hour":
-      return 180;
     case "12hour":
       return 160;
     case "1Day":
@@ -137,16 +162,10 @@ function timeframeToTargetCount(timeframe) {
 
 function timeframeLabel(timeframe) {
   switch (timeframe) {
-    case "1minute":
-      return "1 minute";
-    case "5minute":
-      return "5 minute";
     case "1hour":
       return "1 hour";
     case "4hour":
       return "4 hour";
-    case "8hour":
-      return "8 hour";
     case "12hour":
       return "12 hour";
     case "1Day":
@@ -446,9 +465,6 @@ async function getLiveHistory(symbols, timeframes, years = 5) {
       } else if (timeframe === "12hour") {
         frameCandles = aggregateCandles(frameCandles, 2);
         note = `Derived 12-hour history from Yahoo daily closes for ${symbol}`;
-      } else if (timeframe === "8hour") {
-        frameCandles = aggregateCandles(frameCandles, 3);
-        note = `Derived 8-hour history from Yahoo daily closes for ${symbol}`;
       } else if (timeframe !== "1Day") {
         note = `${symbol} does not expose public ${timeframeLabel(timeframe)} history here; using derived bars from live daily history`;
       }
@@ -528,14 +544,11 @@ const AGENT_CONFIG = [
   }
 ];
 
-const ANALYSIS_TIMEFRAMES = ["1minute", "5minute", "1hour", "4hour", "8hour", "12hour", "1Day", "1Week"];
+const ANALYSIS_TIMEFRAMES = ["1hour", "4hour", "12hour", "1Day", "1Week"];
 
 const TIMEFRAME_WEIGHTS = {
-  "1minute": 8,
-  "5minute": 7,
-  "1hour": 6,
-  "4hour": 5,
-  "8hour": 4,
+  "1hour": 5,
+  "4hour": 4,
   "12hour": 3,
   "1Day": 2,
   "1Week": 1
@@ -544,6 +557,37 @@ const TIMEFRAME_WEIGHTS = {
 function roundTo(value, decimals = 4) {
   const factor = 10 ** decimals;
   return Math.round(value * factor) / factor;
+}
+
+function resolveForexRewardMultiplier(timeframe, pattern, confidence) {
+  const patternBase = (() => {
+    switch (pattern) {
+      case "breakout":
+        return 3.5;
+      case "trend":
+        return 3.0;
+      case "momentum":
+        return 2.8;
+      case "compression":
+        return 2.5;
+      case "reversal":
+        return 2.3;
+      case "range":
+      default:
+        return 2.0;
+    }
+  })();
+
+  const confidenceBonus = confidence >= 80 ? 1.0 : confidence >= 70 ? 0.6 : confidence >= 60 ? 0.3 : 0;
+  const timeframeBonus = {
+    "1hour": 0,
+    "4hour": 0.2,
+    "12hour": 0.5,
+    "1Day": 0.9,
+    "1Week": 1.3
+  };
+
+  return Math.max(2, Math.min(5, patternBase + confidenceBonus + (timeframeBonus[timeframe] || 0)));
 }
 
 function clamp(value, min, max) {
@@ -792,10 +836,65 @@ function buildDeepDiveDimension(technicals, fundamentals, pattern, strategiesApp
   };
 }
 
-function buildTradePlan(price, support, resistance, direction, pattern, confidence) {
+function buildTradePlan(price, support, resistance, direction, pattern, confidence, timeframe, category) {
+  const isForex = category === "forex";
   const range = Math.max(resistance - support, price * 0.0025);
-  const trailPercent = Math.max(0.004, Math.min(0.025, 0.008 + (100 - confidence) / 2000));
-  const rewardMultiplier = pattern === "breakout" || pattern === "trend" ? 2.2 : pattern === "compression" ? 2.5 : 1.8;
+  const trailPercent = isForex ? 0.0015 : Math.max(0.004, Math.min(0.025, 0.008 + (100 - confidence) / 2000));
+  const rewardMultiplier = isForex
+    ? resolveForexRewardMultiplier(timeframe, pattern, confidence)
+    : pattern === "breakout" || pattern === "trend"
+      ? 2.2
+      : pattern === "compression"
+        ? 2.5
+        : 1.8;
+
+  if (isForex) {
+    const stopDistance = Math.max(0.0008, Math.min(price * 0.003, price * 0.0012));
+    const profitDistance = stopDistance * rewardMultiplier;
+
+    if (direction === "up") {
+      const entry = price;
+      const stopLoss = entry - stopDistance;
+      const takeProfit = entry + profitDistance;
+      const trailingStopLoss = entry - stopDistance * 0.6;
+      return {
+        entry: roundTo(entry),
+        stopLoss: roundTo(stopLoss),
+        takeProfit: roundTo(takeProfit),
+        trailingStopLoss: roundTo(trailingStopLoss),
+        trailingStopPercent: roundTo((stopDistance / entry) * 100, 2),
+        riskRewardRatio: roundTo((takeProfit - entry) / Math.max(entry - stopLoss, 0.0000001), 2)
+      };
+    }
+
+    if (direction === "down") {
+      const entry = price;
+      const stopLoss = entry + stopDistance;
+      const takeProfit = entry - profitDistance;
+      const trailingStopLoss = entry + stopDistance * 0.6;
+      return {
+        entry: roundTo(entry),
+        stopLoss: roundTo(stopLoss),
+        takeProfit: roundTo(takeProfit),
+        trailingStopLoss: roundTo(trailingStopLoss),
+        trailingStopPercent: roundTo((stopDistance / entry) * 100, 2),
+        riskRewardRatio: roundTo((entry - takeProfit) / Math.max(stopLoss - entry, 0.0000001), 2)
+      };
+    }
+
+    const entry = price;
+    const stopLoss = entry - stopDistance;
+    const takeProfit = entry + stopDistance * rewardMultiplier;
+    const trailingStopLoss = entry - stopDistance * 0.6;
+    return {
+      entry: roundTo(entry),
+      stopLoss: roundTo(stopLoss),
+      takeProfit: roundTo(takeProfit),
+      trailingStopLoss: roundTo(trailingStopLoss),
+      trailingStopPercent: roundTo((stopDistance / entry) * 100, 2),
+      riskRewardRatio: roundTo((takeProfit - entry) / Math.max(entry - stopLoss, 0.0000001), 2)
+    };
+  }
 
   if (direction === "up") {
     const entry = price;
@@ -849,7 +948,7 @@ function buildSignal(symbol, category, timeframe, pattern, candles, source, live
     : new Date().toISOString();
   const confidence = Math.round(pattern.confidence);
   const strategiesApplied = strategiesForPattern(pattern.pattern, pattern.direction, category, symbol);
-  const tradePlan = buildTradePlan(currentPrice, pattern.support, pattern.resistance, pattern.direction, pattern.pattern, confidence);
+  const tradePlan = buildTradePlan(currentPrice, pattern.support, pattern.resistance, pattern.direction, pattern.pattern, confidence, timeframe, category);
   const technicals = buildTechnicalAnalysis(symbol, timeframe, candles, pattern.support, pattern.resistance);
   const fundamentals = buildFundamentalAnalysis(category, symbol, pattern.direction);
   const deepDive = buildDeepDiveDimension(technicals, fundamentals, pattern, strategiesApplied);
@@ -980,6 +1079,342 @@ async function getLiveAgents() {
   };
 }
 
+function evaluateTradeStatusByLevels(direction, stopLoss, takeProfit, currentPrice) {
+  if (direction === "up") {
+    if (currentPrice >= takeProfit) {
+      return "tp-hit";
+    }
+
+    if (currentPrice <= stopLoss) {
+      return "sl-hit";
+    }
+
+    return "open";
+  }
+
+  if (direction === "down") {
+    if (currentPrice <= takeProfit) {
+      return "tp-hit";
+    }
+
+    if (currentPrice >= stopLoss) {
+      return "sl-hit";
+    }
+
+    return "open";
+  }
+
+  return "open";
+}
+
+function buildSimulatedTradeId(symbol, signal) {
+  return [
+    symbol,
+    signal.timeframe,
+    signal.direction,
+    toUtcDayKey(signal.lastOccurrenceAt)
+  ].join(":");
+}
+
+function normalizeTradeLedger() {
+  const normalized = new Map();
+
+  for (const trade of forexTradeLedger.values()) {
+    const normalizedId = [
+      trade.symbol,
+      trade.timeframe,
+      trade.direction,
+      toUtcDayKey(trade.openedAt)
+    ].join(":");
+
+    const existing = normalized.get(normalizedId);
+    if (!existing) {
+      normalized.set(normalizedId, {
+        ...trade,
+        tradeId: normalizedId
+      });
+      continue;
+    }
+
+    const existingTime = new Date(existing.openedAt).getTime();
+    const candidateTime = new Date(trade.openedAt).getTime();
+    if (candidateTime >= existingTime) {
+      normalized.set(normalizedId, {
+        ...trade,
+        tradeId: normalizedId
+      });
+    }
+  }
+
+  forexTradeLedger.clear();
+  for (const [tradeId, trade] of normalized.entries()) {
+    forexTradeLedger.set(tradeId, trade);
+  }
+}
+
+function trimTradeLedger(maxEntries = 1200) {
+  if (forexTradeLedger.size <= maxEntries) {
+    return;
+  }
+
+  const ordered = Array.from(forexTradeLedger.values()).sort((left, right) => {
+    return new Date(left.openedAt).getTime() - new Date(right.openedAt).getTime();
+  });
+
+  while (ordered.length > maxEntries) {
+    const oldest = ordered.shift();
+    if (oldest) {
+      forexTradeLedger.delete(oldest.tradeId);
+    }
+  }
+}
+
+async function loadForexTradesFromStore() {
+  if (!(dynamoClient && DynamoGetCommand && MT4_SNAPSHOT_TABLE)) {
+    return;
+  }
+
+  try {
+    const record = await dynamoClient.send(new DynamoGetCommand({
+      TableName: MT4_SNAPSHOT_TABLE,
+      Key: {
+        [MT4_SNAPSHOT_PK_NAME]: `${MT4_SNAPSHOT_KEY}#${FOREX_MONITORING_TRADES_PK}`
+      }
+    }));
+
+    const storedTrades = record?.Item?.snapshot?.trades;
+    if (storedTrades && typeof storedTrades === "object") {
+      for (const [tradeId, value] of Object.entries(storedTrades)) {
+        if (value && typeof value === "object") {
+          forexTradeLedger.set(tradeId, value);
+        }
+      }
+    }
+
+    normalizeTradeLedger();
+  } catch {
+    // Keep in-memory fallback if persistence is unavailable.
+  }
+}
+
+async function persistForexTradesToStore() {
+  if (!(dynamoClient && DynamoPutCommand && MT4_SNAPSHOT_TABLE)) {
+    return;
+  }
+
+  try {
+    await dynamoClient.send(new DynamoPutCommand({
+      TableName: MT4_SNAPSHOT_TABLE,
+      Item: {
+        [MT4_SNAPSHOT_PK_NAME]: `${MT4_SNAPSHOT_KEY}#${FOREX_MONITORING_TRADES_PK}`,
+        snapshot: {
+          key: FOREX_MONITORING_TRADES_SK,
+          trades: Object.fromEntries(forexTradeLedger.entries())
+        },
+        updatedAt: new Date().toISOString()
+      }
+    }));
+  } catch {
+    // Keep in-memory fallback if persistence is unavailable.
+  }
+}
+
+async function upsertSimulatedTradesFromForexAgent(forex, generatedAt) {
+  if (forexTradeLedger.size === 0) {
+    await loadForexTradesFromStore();
+  }
+
+  normalizeTradeLedger();
+
+  for (const symbolReport of forex.symbols || []) {
+    for (const signal of symbolReport.timeframeSignals || []) {
+      if (signal.direction === "neutral") {
+        continue;
+      }
+
+      const tradeId = buildSimulatedTradeId(symbolReport.symbol, signal);
+      if (forexTradeLedger.has(tradeId)) {
+        continue;
+      }
+
+      const openedAt = Number.isFinite(Date.parse(signal.lastOccurrenceAt)) ? signal.lastOccurrenceAt : generatedAt;
+      forexTradeLedger.set(tradeId, {
+        tradeId,
+        symbol: symbolReport.symbol,
+        timeframe: signal.timeframe,
+        direction: signal.direction,
+        entry: signal.tradePlan.entry,
+        stopLoss: signal.tradePlan.stopLoss,
+        takeProfit: signal.tradePlan.takeProfit,
+        currentPrice: symbolReport.currentPrice,
+        riskRewardRatio: signal.tradePlan.riskRewardRatio,
+        status: "open",
+        openedAt
+      });
+    }
+  }
+
+  trimTradeLedger();
+}
+
+function updateOpenTradesWithCurrentPrices(forex, generatedAt) {
+  const priceBySymbol = new Map();
+  for (const symbolReport of forex.symbols || []) {
+    priceBySymbol.set(symbolReport.symbol, symbolReport.currentPrice);
+  }
+
+  for (const [tradeId, trade] of forexTradeLedger.entries()) {
+    if (trade.status !== "open") {
+      continue;
+    }
+
+    const currentPrice = priceBySymbol.get(trade.symbol);
+    if (!Number.isFinite(currentPrice)) {
+      continue;
+    }
+
+    const status = evaluateTradeStatusByLevels(trade.direction, trade.stopLoss, trade.takeProfit, currentPrice);
+    if (status === "open") {
+      if (trade.currentPrice !== currentPrice) {
+        forexTradeLedger.set(tradeId, {
+          ...trade,
+          currentPrice
+        });
+      }
+      continue;
+    }
+
+    forexTradeLedger.set(tradeId, {
+      ...trade,
+      status,
+      currentPrice,
+      closePrice: currentPrice,
+      closedAt: generatedAt
+    });
+  }
+}
+
+async function getForexMonitoringReport() {
+  const agents = await getLiveAgents();
+  const forex = (agents.data || []).find((agent) => agent.agent === "Forex");
+  const generatedAt = new Date().toISOString();
+
+  if (!forex) {
+    return {
+      totalTrades: 0,
+      tpHitCount: 0,
+      slHitCount: 0,
+      openCount: 0,
+      closedTrades: 0,
+      activeTrades: 0,
+      resolvedTrades: 0,
+      winRatePercent: 0,
+      generatedAt,
+      items: []
+    };
+  }
+
+  await upsertSimulatedTradesFromForexAgent(forex, generatedAt);
+  updateOpenTradesWithCurrentPrices(forex, generatedAt);
+  await persistForexTradesToStore();
+
+  const items = Array.from(forexTradeLedger.values()).sort((left, right) => {
+    return new Date(right.openedAt).getTime() - new Date(left.openedAt).getTime();
+  });
+
+  const tpHitCount = items.filter((item) => item.status === "tp-hit").length;
+  const slHitCount = items.filter((item) => item.status === "sl-hit").length;
+  const openCount = items.filter((item) => item.status === "open").length;
+  const resolvedTrades = tpHitCount + slHitCount;
+  const winRatePercent = resolvedTrades > 0 ? roundTo((tpHitCount / resolvedTrades) * 100, 2) : 0;
+
+  return {
+    totalTrades: items.length,
+    tpHitCount,
+    slHitCount,
+    openCount,
+    closedTrades: resolvedTrades,
+    activeTrades: openCount,
+    resolvedTrades,
+    winRatePercent,
+    generatedAt,
+    items
+  };
+}
+
+function buildHistoryDateRange(daysRequested) {
+  const end = new Date();
+  const days = [];
+
+  for (let index = daysRequested - 1; index >= 0; index -= 1) {
+    const current = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate()));
+    current.setUTCDate(current.getUTCDate() - index);
+    days.push(current.toISOString().slice(0, 10));
+  }
+
+  return days;
+}
+
+async function getForexMonitoringHistory(days = 10) {
+  const daysRequested = Math.max(1, Math.min(30, Math.round(Number(days) || 10)));
+  await getForexMonitoringReport();
+
+  const dayKeys = buildHistoryDateRange(daysRequested);
+  const daily = dayKeys.map((dayKey) => {
+    const ledgerItems = Array.from(forexTradeLedger.values());
+    const openedTrades = ledgerItems.filter((item) => toUtcDayKey(item.openedAt) === dayKey).length;
+    const tpHitCount = ledgerItems.filter((item) => item.status === "tp-hit" && item.closedAt && toUtcDayKey(item.closedAt) === dayKey).length;
+    const slHitCount = ledgerItems.filter((item) => item.status === "sl-hit" && item.closedAt && toUtcDayKey(item.closedAt) === dayKey).length;
+    const openCount = ledgerItems.filter((item) => item.status === "open" && toUtcDayKey(item.openedAt) === dayKey).length;
+    const resolvedTrades = tpHitCount + slHitCount;
+    const hasData = openedTrades > 0 || resolvedTrades > 0;
+
+    if (hasData) {
+      return {
+        date: dayKey,
+        openedTrades,
+        totalTrades: openedTrades,
+        tpHitCount,
+        slHitCount,
+        openCount,
+        resolvedTrades,
+        winRatePercent: resolvedTrades > 0 ? roundTo((tpHitCount / resolvedTrades) * 100, 2) : null,
+        hasData,
+        generatedAt: new Date().toISOString()
+      };
+    }
+
+    return {
+      date: dayKey,
+      openedTrades: 0,
+      totalTrades: 0,
+      tpHitCount: 0,
+      slHitCount: 0,
+      openCount: 0,
+      resolvedTrades: 0,
+      winRatePercent: null,
+      hasData: false,
+      generatedAt: new Date(`${dayKey}T00:00:00.000Z`).toISOString()
+    };
+  });
+
+  const observedDays = daily.filter((item) => item.hasData).length;
+  const totalTpHitCount = daily.reduce((sum, item) => sum + Number(item.tpHitCount || 0), 0);
+  const totalSlHitCount = daily.reduce((sum, item) => sum + Number(item.slHitCount || 0), 0);
+  const totalResolvedTrades = totalTpHitCount + totalSlHitCount;
+
+  return {
+    daysRequested,
+    observedDays,
+    totalTpHitCount,
+    totalSlHitCount,
+    totalResolvedTrades,
+    overallWinRatePercent: totalResolvedTrades > 0 ? roundTo((totalTpHitCount / totalResolvedTrades) * 100, 2) : null,
+    generatedAt: new Date().toISOString(),
+    daily
+  };
+}
+
 async function fetchYahooDailyClose(symbol) {
   const response = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`, {
     headers: {
@@ -1025,6 +1460,390 @@ function json(statusCode, body) {
       "content-type": "application/json; charset=utf-8"
     },
     body: JSON.stringify(body)
+  };
+}
+
+function html(statusCode, body) {
+  return {
+    statusCode,
+    headers: {
+      "content-type": "text/html; charset=utf-8"
+    },
+    body
+  };
+}
+
+function escapeHtml(input) {
+  return String(input)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function formatNumber(value, decimals = 2) {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+
+  return Number(value).toFixed(decimals);
+}
+
+function wantsHtml(event) {
+  const acceptHeader = getHeaderValue(event, "accept");
+  const query = event?.queryStringParameters || {};
+  const format = typeof query.format === "string" ? query.format.toLowerCase() : "";
+  return format === "html" || acceptHeader.includes("text/html");
+}
+
+function renderMonitoringReportHtml(report) {
+  const rows = (report.items || [])
+    .map((item) => {
+      const statusClass = item.status === "tp-hit" ? "tp" : item.status === "sl-hit" ? "sl" : "open";
+      return `<tr>
+        <td>${escapeHtml(item.tradeId)}</td>
+        <td>${escapeHtml(item.symbol)}</td>
+        <td>${escapeHtml(item.timeframe)}</td>
+        <td>${escapeHtml(String(item.direction || "").toUpperCase())}</td>
+        <td>${formatNumber(item.entry, 4)}</td>
+        <td>${formatNumber(item.stopLoss, 4)}</td>
+        <td>${formatNumber(item.takeProfit, 4)}</td>
+        <td>${formatNumber(item.currentPrice, 4)}</td>
+        <td>1:${formatNumber(item.riskRewardRatio, 2)}</td>
+        <td class="${statusClass}">${escapeHtml(String(item.status || "").toUpperCase())}</td>
+        <td>${escapeHtml(item.openedAt)}</td>
+        <td>${item.closedAt ? escapeHtml(item.closedAt) : "-"}</td>
+      </tr>`;
+    })
+    .join("\n");
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Forex Trade Monitoring Report</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: "Segoe UI", Tahoma, sans-serif; margin: 0; background: #f4f8fb; color: #102132; }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 20px; }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    .meta { color: #466176; margin-bottom: 14px; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fill,minmax(170px,1fr)); gap: 10px; margin-bottom: 16px; }
+    .stat { background: #ffffff; border: 1px solid #d7e3ec; border-radius: 10px; padding: 10px; }
+    .stat .k { display: block; color: #4d6477; font-size: 12px; margin-bottom: 3px; }
+    .stat .v { font-size: 20px; font-weight: 700; color: #0b2f4a; }
+    table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d7e3ec; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #edf2f6; font-size: 12px; }
+    th { background: #f0f6fb; color: #26435c; position: sticky; top: 0; }
+    .tp { color: #166534; font-weight: 700; }
+    .sl { color: #b91c1c; font-weight: 700; }
+    .open { color: #9a6700; font-weight: 700; }
+    .table-wrap { overflow: auto; border-radius: 10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Forex Trade Monitoring Report</h1>
+    <div class="meta">Generated at ${escapeHtml(report.generatedAt)}</div>
+    <section class="stats">
+      <div class="stat"><span class="k">Total Trades</span><span class="v">${report.totalTrades}</span></div>
+      <div class="stat"><span class="k">TP Hit</span><span class="v">${report.tpHitCount}</span></div>
+      <div class="stat"><span class="k">SL Hit</span><span class="v">${report.slHitCount}</span></div>
+      <div class="stat"><span class="k">Open</span><span class="v">${report.openCount}</span></div>
+      <div class="stat"><span class="k">Resolved</span><span class="v">${report.resolvedTrades}</span></div>
+      <div class="stat"><span class="k">Win Rate</span><span class="v">${formatNumber(report.winRatePercent)}%</span></div>
+    </section>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Trade ID</th>
+            <th>Symbol</th>
+            <th>Timeframe</th>
+            <th>Direction</th>
+            <th>Entry</th>
+            <th>SL</th>
+            <th>TP</th>
+            <th>Current</th>
+            <th>R:R</th>
+            <th>Status</th>
+            <th>Opened</th>
+            <th>Closed</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+function renderMonitoringHistoryHtml(report) {
+  const rows = (report.daily || [])
+    .map((day) => `<tr>
+      <td>${escapeHtml(day.date)}</td>
+      <td>${day.hasData ? "Yes" : "No"}</td>
+      <td>${day.openedTrades}</td>
+      <td>${day.totalTrades}</td>
+      <td>${day.tpHitCount}</td>
+      <td>${day.slHitCount}</td>
+      <td>${day.openCount}</td>
+      <td>${day.resolvedTrades}</td>
+      <td>${day.winRatePercent == null ? "-" : `${formatNumber(day.winRatePercent)}%`}</td>
+    </tr>`)
+    .join("\n");
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>10-Day Forex Success Rate View</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: "Segoe UI", Tahoma, sans-serif; margin: 0; background: #f4f8fb; color: #102132; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 20px; }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    .meta { color: #466176; margin-bottom: 14px; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fill,minmax(180px,1fr)); gap: 10px; margin-bottom: 16px; }
+    .stat { background: #ffffff; border: 1px solid #d7e3ec; border-radius: 10px; padding: 10px; }
+    .stat .k { display: block; color: #4d6477; font-size: 12px; margin-bottom: 3px; }
+    .stat .v { font-size: 20px; font-weight: 700; color: #0b2f4a; }
+    table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d7e3ec; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #edf2f6; font-size: 12px; }
+    th { background: #f0f6fb; color: #26435c; }
+    .table-wrap { overflow: auto; border-radius: 10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>10-Day Forex Success Rate View</h1>
+    <div class="meta">Generated at ${escapeHtml(report.generatedAt)}</div>
+    <section class="stats">
+      <div class="stat"><span class="k">Days Requested</span><span class="v">${report.daysRequested}</span></div>
+      <div class="stat"><span class="k">Observed Days</span><span class="v">${report.observedDays}</span></div>
+      <div class="stat"><span class="k">Total TP Hit</span><span class="v">${report.totalTpHitCount}</span></div>
+      <div class="stat"><span class="k">Total SL Hit</span><span class="v">${report.totalSlHitCount}</span></div>
+      <div class="stat"><span class="k">Resolved Trades</span><span class="v">${report.totalResolvedTrades}</span></div>
+      <div class="stat"><span class="k">Overall Win Rate</span><span class="v">${report.overallWinRatePercent == null ? "-" : `${formatNumber(report.overallWinRatePercent)}%`}</span></div>
+    </section>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Has Data</th>
+            <th>Opened</th>
+            <th>Total</th>
+            <th>TP Hit</th>
+            <th>SL Hit</th>
+            <th>Open</th>
+            <th>Resolved</th>
+            <th>Win Rate</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+let latestMt4Snapshot = null;
+
+function getHeaderValue(event, headerName) {
+  const headers = event?.headers || {};
+  const match = Object.keys(headers).find((key) => key.toLowerCase() === headerName.toLowerCase());
+  return match ? String(headers[match]) : "";
+}
+
+function parseEventBody(event) {
+  if (!event || !event.body) {
+    return {};
+  }
+
+  if (typeof event.body !== "string") {
+    return event.body;
+  }
+
+  const bodyString = event.isBase64Encoded
+    ? Buffer.from(event.body, "base64").toString("utf8")
+    : event.body;
+
+  try {
+    return JSON.parse(bodyString);
+  } catch {
+    return {};
+  }
+}
+
+function normalizeMt4Snapshot(body) {
+  if (!body || typeof body !== "object") {
+    return null;
+  }
+
+  const accountId = typeof body.accountId === "string" ? body.accountId.trim() : "";
+  const terminalId = typeof body.terminalId === "string" ? body.terminalId.trim() : "";
+  if (!accountId || !terminalId) {
+    return null;
+  }
+
+  const timestamp = (() => {
+    const raw = typeof body.timestamp === "string" ? body.timestamp : "";
+    return Number.isFinite(Date.parse(raw)) ? raw : new Date().toISOString();
+  })();
+
+  const toNumberOrUndefined = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : undefined;
+  };
+
+  const positions = Array.isArray(body.positions)
+    ? body.positions
+      .filter((item) => item && typeof item.symbol === "string" && (item.side === "BUY" || item.side === "SELL"))
+      .map((item) => ({
+        symbol: item.symbol,
+        side: item.side,
+        volume: Number(item.volume) || 0,
+        openPrice: Number(item.openPrice) || 0,
+        profit: Number(item.profit) || 0,
+        stopLoss: toNumberOrUndefined(item.stopLoss),
+        takeProfit: toNumberOrUndefined(item.takeProfit)
+      }))
+    : [];
+
+  const pendingOrders = Array.isArray(body.pendingOrders)
+    ? body.pendingOrders
+      .filter((item) => item && typeof item.symbol === "string" && typeof item.type === "string")
+      .map((item) => ({
+        symbol: item.symbol,
+        type: item.type,
+        price: Number(item.price) || 0,
+        volume: Number(item.volume) || 0,
+        stopLoss: toNumberOrUndefined(item.stopLoss),
+        takeProfit: toNumberOrUndefined(item.takeProfit)
+      }))
+    : [];
+
+  const quotes = Array.isArray(body.quotes)
+    ? body.quotes
+      .filter((item) => item && typeof item.symbol === "string")
+      .map((item) => ({
+        symbol: item.symbol,
+        bid: Number(item.bid) || 0,
+        ask: Number(item.ask) || 0,
+        spread: toNumberOrUndefined(item.spread),
+        timestamp: Number.isFinite(Date.parse(item.timestamp)) ? item.timestamp : new Date().toISOString()
+      }))
+    : [];
+
+  return {
+    accountId,
+    terminalId,
+    server: typeof body.server === "string" ? body.server : undefined,
+    timestamp,
+    heartbeat: Number.isFinite(Number(body.heartbeat)) ? Math.max(0, Math.floor(Number(body.heartbeat))) : undefined,
+    balance: toNumberOrUndefined(body.balance),
+    equity: toNumberOrUndefined(body.equity),
+    margin: toNumberOrUndefined(body.margin),
+    freeMargin: toNumberOrUndefined(body.freeMargin),
+    positions,
+    pendingOrders,
+    quotes
+  };
+}
+
+function describeSnapshotHealth(ageSeconds) {
+  if (ageSeconds <= 30) {
+    return {
+      healthStatus: "fresh",
+      healthNote: "Snapshot is live (<= 30s old)"
+    };
+  }
+
+  if (ageSeconds <= 180) {
+    return {
+      healthStatus: "stale",
+      healthNote: "Snapshot is delayed (> 30s old)"
+    };
+  }
+
+  return {
+    healthStatus: "offline",
+    healthNote: "Snapshot feed appears offline (> 3m old)"
+  };
+}
+
+async function storeMt4Snapshot(snapshot) {
+  const receivedAt = new Date().toISOString();
+  const ageSeconds = Math.max(0, Math.round((Date.now() - Date.parse(snapshot.timestamp)) / 1000));
+  const health = describeSnapshotHealth(ageSeconds);
+  const materialized = {
+    ...snapshot,
+    source: "mt4",
+    receivedAt,
+    ageSeconds,
+    ...health
+  };
+
+  latestMt4Snapshot = materialized;
+
+  if (dynamoClient && DynamoPutCommand) {
+    try {
+      await dynamoClient.send(new DynamoPutCommand({
+        TableName: MT4_SNAPSHOT_TABLE,
+        Item: {
+          [MT4_SNAPSHOT_PK_NAME]: MT4_SNAPSHOT_KEY,
+          snapshot: materialized,
+          updatedAt: receivedAt
+        }
+      }));
+    } catch {
+      // Keep in-memory snapshot as fallback.
+    }
+  }
+
+  return materialized;
+}
+
+async function getMt4Snapshot() {
+  if (dynamoClient && DynamoGetCommand) {
+    try {
+      const record = await dynamoClient.send(new DynamoGetCommand({
+        TableName: MT4_SNAPSHOT_TABLE,
+        Key: {
+          [MT4_SNAPSHOT_PK_NAME]: MT4_SNAPSHOT_KEY
+        }
+      }));
+
+      const stored = record?.Item?.snapshot;
+      if (stored && typeof stored === "object") {
+        latestMt4Snapshot = stored;
+      }
+    } catch {
+      // Fallback to in-memory snapshot.
+    }
+  }
+
+  if (!latestMt4Snapshot) {
+    return null;
+  }
+
+  const ageSeconds = Math.max(0, Math.round((Date.now() - Date.parse(latestMt4Snapshot.timestamp)) / 1000));
+  const health = describeSnapshotHealth(ageSeconds);
+
+  return {
+    ...latestMt4Snapshot,
+    ageSeconds,
+    ...health
   };
 }
 
@@ -1271,46 +2090,90 @@ async function getLiveTrends() {
 }
 
 async function getLiveShares() {
-  const symbols = ["AAPL", "IBM", "MSFT"];
-  const rows = [];
+  const universe = [
+    "MSFT", "NVDA", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "JPM", "XOM", "CVX",
+    "UNH", "JNJ", "PG", "KO", "PEP", "WMT", "HD", "MCD", "ABBV", "LLY"
+  ];
 
-  for (const symbol of symbols) {
-    try {
-      const quote = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=demo`).then((r) => r.json());
-      const q = quote["Global Quote"];
-      if (!q) {
-        continue;
+  const buildFallbackRows = (existingRows = []) => {
+    const existingBySymbol = new Map(existingRows.map((row) => [row.symbol, row]));
+    const seededRows = universe.map((symbol, index) => {
+      const existing = existingBySymbol.get(symbol);
+      if (existing) {
+        return existing;
       }
 
-      const price = Number(q["05. price"] || 0);
-      const changePercentRaw = String(q["10. change percent"] || "0").replace("%", "");
-      const changePercent = Number(changePercentRaw || 0);
+      const seed = hashString(`${symbol}:${index}`);
+      const basePrice = 40 + (seed % 460);
+      const drift = ((seed % 900) / 100) - 4.5;
+      const score = Math.max(50, Math.min(92, Math.round(Math.abs(drift) * 7 + 56)));
 
-      if (!Number.isFinite(price) || price <= 0) {
-        continue;
-      }
-
-      rows.push({
+      return {
         symbol,
         name: symbol,
-        price,
-        changePercent,
-        rationale: "Live quote via Alpha Vantage demo endpoint",
+        price: Number(basePrice.toFixed(2)),
+        changePercent: Number(drift.toFixed(2)),
+        source: "fallback",
+        rationale: "Fallback ranked share while live quote provider is unavailable",
         sector: "Market",
-        score: Math.max(50, Math.min(90, Math.round(Math.abs(changePercent) * 8 + 58))),
+        score,
         factorScores: {
-          momentum: Math.max(50, Math.min(90, Math.round(Math.abs(changePercent) * 10 + 55))),
-          volatility: 60,
-          sentiment: 56,
-          participation: 54
+          momentum: Math.max(50, Math.min(92, Math.round(Math.abs(drift) * 9 + 54))),
+          volatility: 58,
+          sentiment: 55,
+          participation: 53
         }
-      });
-    } catch {
-      continue;
-    }
-  }
+      };
+    });
 
-  return { data: rows };
+    return seededRows
+      .sort((a, b) => (b.score || 0) - (a.score || 0))
+      .slice(0, 20);
+  };
+
+  try {
+    const url = new URL("https://query1.finance.yahoo.com/v7/finance/quote");
+    url.searchParams.set("symbols", universe.join(","));
+    const payload = await fetch(url.toString(), {
+      headers: {
+        "User-Agent": "market-analysis-live-api"
+      }
+    }).then((r) => r.json());
+
+    const rows = (payload?.quoteResponse?.result || [])
+      .map((item) => {
+        const symbol = typeof item.symbol === "string" ? item.symbol : "";
+        const price = Number(item.regularMarketPrice || 0);
+        const changePercent = Number(item.regularMarketChangePercent || 0);
+        if (!symbol || !Number.isFinite(price) || price <= 0 || !Number.isFinite(changePercent)) {
+          return null;
+        }
+
+        return {
+          symbol,
+          name: item.longName || symbol,
+          price,
+          changePercent,
+          source: "live",
+          rationale: "Live quote via Yahoo Finance multi-quote endpoint",
+          sector: item.sector || "Market",
+          score: Math.max(50, Math.min(95, Math.round(Math.abs(changePercent) * 8 + 58))),
+          factorScores: {
+            momentum: Math.max(50, Math.min(95, Math.round(Math.abs(changePercent) * 10 + 55))),
+            volatility: 60,
+            sentiment: 56,
+            participation: 54
+          }
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => (b.score || 0) - (a.score || 0))
+      .slice(0, 20);
+
+    return { data: buildFallbackRows(rows) };
+  } catch {
+    return { data: buildFallbackRows() };
+  }
 }
 
 exports.handler = async (event) => {
@@ -1338,6 +2201,97 @@ exports.handler = async (event) => {
       return json(200, await getLiveAgents());
     }
 
+    if (path === "/api/market/forex-monitoring-report") {
+      const report = await getForexMonitoringReport();
+      if (wantsHtml(event)) {
+        return html(200, renderMonitoringReportHtml(report));
+      }
+
+      return json(200, report);
+    }
+
+    if (path === "/api/market/forex-monitoring-history") {
+      const query = event?.queryStringParameters || {};
+      const days = Number(query.days);
+      const report = await getForexMonitoringHistory(Number.isFinite(days) ? days : 10);
+      if (wantsHtml(event)) {
+        return html(200, renderMonitoringHistoryHtml(report));
+      }
+
+      return json(200, report);
+    }
+
+    if (path === "/api/notify/status") {
+      return json(200, {
+        enabled: false,
+        running: false,
+        targets: 0,
+        intervalMs: null,
+        seeded: false,
+        seenNewsCount: 0,
+        lastRunAt: null,
+        lastSuccessAt: null,
+        lastSource: null,
+        lastReason: null,
+        lastSentCount: 0,
+        totalSentCount: 0,
+        lastError: null
+      });
+    }
+
+    if (path === "/api/mt4/snapshot") {
+      if (method === "GET") {
+        const snapshot = await getMt4Snapshot();
+        if (!snapshot) {
+          return json(404, { error: "No MT4 snapshot received yet" });
+        }
+
+        return json(200, snapshot);
+      }
+
+      if (method === "POST") {
+        if (MT4_SNAPSHOT_API_KEY) {
+          const providedApiKey = getHeaderValue(event, "x-api-key");
+          if (!providedApiKey || providedApiKey !== MT4_SNAPSHOT_API_KEY) {
+            return json(401, { error: "Unauthorized" });
+          }
+        }
+
+        const body = parseEventBody(event);
+        const snapshot = normalizeMt4Snapshot(body);
+
+        if (!snapshot) {
+          return json(400, { error: "Invalid payload" });
+        }
+
+        return json(202, await storeMt4Snapshot(snapshot));
+      }
+
+      return json(405, { error: "Method not allowed" });
+    }
+
+    if (path === "/api/mt4/quotes") {
+      if (method !== "GET") {
+        return json(405, { error: "Method not allowed" });
+      }
+
+      const snapshot = await getMt4Snapshot();
+      if (!snapshot) {
+        return json(404, { error: "No MT4 snapshot received yet" });
+      }
+
+      return json(200, {
+        source: snapshot.source,
+        receivedAt: snapshot.receivedAt,
+        timestamp: snapshot.timestamp,
+        heartbeat: snapshot.heartbeat,
+        ageSeconds: snapshot.ageSeconds,
+        healthStatus: snapshot.healthStatus,
+        healthNote: snapshot.healthNote,
+        quotes: Array.isArray(snapshot.quotes) ? snapshot.quotes : []
+      });
+    }
+
     if (path === "/api/market/best-shares") {
       return json(200, await getLiveShares());
     }
@@ -1347,7 +2301,7 @@ exports.handler = async (event) => {
         return json(405, { error: "Method not allowed" });
       }
 
-      const body = typeof event.body === "string" ? JSON.parse(event.body) : event.body || {};
+      const body = parseEventBody(event);
       const symbols = Array.isArray(body.symbols) ? body.symbols : [];
       const timeframes = Array.isArray(body.timeframes) ? body.timeframes : [];
       const years = Number.isFinite(Number(body.years)) ? Number(body.years) : 5;

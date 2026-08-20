@@ -7,7 +7,10 @@ import { AgentsScreen } from "./src/screens/AgentsScreen";
 import { TrendsScreen } from "./src/screens/TrendsScreen";
 import { BestSharesScreen } from "./src/screens/BestSharesScreen";
 import { SettingsScreen } from "./src/screens/SettingsScreen";
+import { fetchMt4Quotes } from "./src/api/client";
+import { usePollingData } from "./src/hooks/usePollingData";
 import { theme } from "./src/theme";
+import { Mt4Quote } from "./src/types";
 
 type TabKey = "updates" | "trends" | "history" | "agents" | "shares" | "notify";
 
@@ -22,6 +25,16 @@ const tabs: { key: TabKey; label: string }[] = [
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("updates");
+  const mt4Quotes = usePollingData(fetchMt4Quotes, 15_000);
+
+  const liveQuotes = mt4Quotes.data?.quotes ?? [];
+  const feedHealth = mt4Quotes.data?.healthStatus ?? (mt4Quotes.error ? "offline" : "stale");
+  const liveQuotesFresh = feedHealth === "fresh" && liveQuotes.length > 0;
+
+  function formatQuote(quote: Mt4Quote) {
+    const decimals = quote.symbol.toUpperCase().includes("JPY") ? 3 : 5;
+    return `${quote.symbol} ${quote.bid.toFixed(decimals)}/${quote.ask.toFixed(decimals)}`;
+  }
 
   const content = useMemo(() => {
     if (activeTab === "updates") {
@@ -50,6 +63,32 @@ export default function App() {
         <Text style={styles.title}>Global Market Analysis</Text>
         <Text style={styles.subtitle}>Actionable updates for faster trading decisions</Text>
       </View>
+
+      <Pressable
+        onPress={() => setActiveTab("notify")}
+        style={[
+          styles.liveStrip,
+          feedHealth === "fresh"
+            ? styles.liveStripFresh
+            : feedHealth === "stale"
+              ? styles.liveStripStale
+              : styles.liveStripOffline
+        ]}
+        accessibilityRole="button"
+        accessibilityLabel="Open MT4 feed details"
+      >
+        <Text style={styles.liveStripLabel}>MT4 Live Feed · {feedHealth.toUpperCase()}</Text>
+        <Text style={styles.liveStripText}>
+          {mt4Quotes.loading
+            ? "Loading realtime quotes..."
+            : mt4Quotes.error
+              ? mt4Quotes.error
+              : liveQuotes.length
+                ? `${feedHealth.toUpperCase()} | ${liveQuotes.slice(0, 3).map(formatQuote).join("   ")}`
+                : "No live quotes yet"}
+        </Text>
+        <Text style={styles.liveStripHint}>Tap to open the MT4 feed panel</Text>
+      </Pressable>
 
       <View style={styles.tabRow}>
         {tabs.map((tab) => (
@@ -87,6 +126,44 @@ const styles = StyleSheet.create({
     color: theme.colors.muted,
     marginTop: 4,
     fontSize: 14
+  },
+  liveStrip: {
+    borderRadius: 14,
+    borderWidth: 1,
+    marginBottom: 14,
+    paddingVertical: 10,
+    paddingHorizontal: 12
+  },
+  liveStripFresh: {
+    backgroundColor: "#0e2a1f",
+    borderColor: "#2d7d5b"
+  },
+  liveStripStale: {
+    backgroundColor: "#33250e",
+    borderColor: "#c58b2a"
+  },
+  liveStripOffline: {
+    backgroundColor: "#331515",
+    borderColor: "#c44a4a"
+  },
+  liveStripLabel: {
+    color: theme.colors.accent,
+    fontSize: 11,
+    fontWeight: "800",
+    letterSpacing: 0.6,
+    textTransform: "uppercase"
+  },
+  liveStripText: {
+    color: theme.colors.text,
+    marginTop: 4,
+    fontSize: 12,
+    fontWeight: "600"
+  },
+  liveStripHint: {
+    color: theme.colors.muted,
+    marginTop: 4,
+    fontSize: 11,
+    fontWeight: "600"
   },
   tabRow: {
     flexDirection: "row",
