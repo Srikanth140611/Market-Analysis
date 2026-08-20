@@ -8,7 +8,12 @@ type PollingCacheEntry = {
 
 const pollingCache = new Map<string, PollingCacheEntry>();
 
-export function usePollingData<T>(fetcher: () => Promise<T>, intervalMs: number, cacheKey?: string) {
+type PollingOptions = {
+  keepPreviousDataOnError?: boolean;
+};
+
+export function usePollingData<T>(fetcher: () => Promise<T>, intervalMs: number, cacheKey?: string, options?: PollingOptions) {
+  const keepPreviousDataOnError = options?.keepPreviousDataOnError ?? true;
   const cached = cacheKey ? pollingCache.get(cacheKey) : undefined;
   const [data, setData] = useState<T | null>(() => (cached ? (cached.data as T) : null));
   const [loading, setLoading] = useState(() => !cached);
@@ -51,11 +56,14 @@ export function usePollingData<T>(fetcher: () => Promise<T>, intervalMs: number,
       if (nextNotice) {
         setError(null);
         setNotice(nextNotice);
-      } else if (data) {
+      } else if (data && keepPreviousDataOnError) {
         // Keep last known good data and avoid noisy transient failures.
         setError(null);
         setNotice("Live refresh is delayed. Showing last successful data.");
       } else {
+        if (!keepPreviousDataOnError) {
+          setData(null);
+        }
         setError(err instanceof Error ? err.message : "Something went wrong");
         setNotice(null);
       }
@@ -63,7 +71,7 @@ export function usePollingData<T>(fetcher: () => Promise<T>, intervalMs: number,
       setLoading(false);
       inFlight.current = false;
     }
-  }, [cacheKey, data]);
+  }, [cacheKey, data, keepPreviousDataOnError]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;

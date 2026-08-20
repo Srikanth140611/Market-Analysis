@@ -509,7 +509,9 @@ function AgentCard({
 }
 
 export function AgentsScreen() {
-  const { data, loading, error } = usePollingData(fetchMarketAgents, REFRESH_INTERVAL_MS, "market-agents");
+  const { data, loading, error } = usePollingData(fetchMarketAgents, REFRESH_INTERVAL_MS, undefined, {
+    keepPreviousDataOnError: false
+  });
   const mt4QuotesFeed = usePollingData(fetchMt4Quotes, MT4_QUOTES_REFRESH_MS, "mt4-quotes");
   const { width } = useWindowDimensions();
   const [expandedSymbols, setExpandedSymbols] = useState<Record<string, boolean>>({});
