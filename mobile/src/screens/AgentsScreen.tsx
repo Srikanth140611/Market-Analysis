@@ -142,6 +142,20 @@ function quoteFreshnessColor(timestamp?: string) {
   return theme.colors.negative;
 }
 
+function quoteAgeLabel(timestamp?: string) {
+  if (!timestamp) {
+    return "";
+  }
+
+  const parsed = Date.parse(timestamp);
+  if (!Number.isFinite(parsed)) {
+    return "";
+  }
+
+  const ageSeconds = Math.max(0, Math.floor((Date.now() - parsed) / 1000));
+  return `${ageSeconds}s old`;
+}
+
 function estimateBuyPrice(signal: MarketAgentTimeframeSignal) {
   const spread = Math.max(0.00008, Math.min(0.00022, signal.currentPrice * 0.00012));
   return signal.currentPrice + spread / 2;
@@ -288,6 +302,8 @@ function AgentCard({
             const mt4Quote = findMt4Quote(symbol.symbol, quotesBySymbol);
             const liveBuy = mt4Quote?.ask ?? estimateBuyPrice(signal);
             const liveSell = mt4Quote?.bid ?? estimateSellPrice(signal);
+            const liveTime = formatAestTimestamp(mt4Quote?.timestamp);
+            const liveAge = quoteAgeLabel(mt4Quote?.timestamp);
             const analysisKey = `${agent.agent}:${symbol.symbol}:${signal.timeframe}`;
             const analysisOpen = selectedAnalysisKey === analysisKey;
 
@@ -297,7 +313,7 @@ function AgentCard({
                   <Text style={[styles.forexCell, styles.cellPair]}>
                     {symbol.symbol}
                     {"\n"}
-                    <Text style={styles.inlineLiveTime}>AEST {formatAestTimestamp(mt4Quote?.timestamp)}</Text>
+                    <Text style={styles.inlineLiveTime}>AEST {liveTime}{liveAge ? ` (${liveAge})` : ""}</Text>
                   </Text>
                   <Text style={[styles.forexCell, styles.cellPrice]}>{formatForexQuote(symbol.symbol, liveBuy)}</Text>
                   <Text style={[styles.forexCell, styles.cellPrice]}>{formatForexQuote(symbol.symbol, liveSell)}</Text>
@@ -308,7 +324,7 @@ function AgentCard({
                       { color: quoteFreshnessColor(mt4Quote?.timestamp) }
                     ]}
                   >
-                    {formatAestTimestamp(mt4Quote?.timestamp)}
+                    {liveTime}{liveAge ? ` (${liveAge})` : ""}
                   </Text>
                   <Text style={[styles.forexCell, styles.cellTimeframe]}>{signal.timeframe}</Text>
                   <Text style={[styles.forexCell, styles.cellTrend, { color: directionColor(signal.direction) }]}>{signal.direction.toUpperCase()}</Text>
