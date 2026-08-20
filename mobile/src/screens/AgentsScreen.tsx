@@ -21,6 +21,7 @@ const AGENT_MENU = [
   { key: "oil", label: "Oil Analysis", match: "Oil" }
 ] as const;
 const MT4_QUOTES_REFRESH_MS = Platform.OS === "web" ? 5_000 : 3_000;
+const MAX_LIVE_QUOTE_AGE_SECONDS = 30;
 
 function sourceColor(source: string) {
   if (source === "live") {
@@ -142,17 +143,29 @@ function quoteFreshnessColor(timestamp?: string) {
   return theme.colors.negative;
 }
 
-function quoteAgeLabel(timestamp?: string) {
+function quoteAgeSeconds(timestamp?: string) {
   if (!timestamp) {
-    return "";
+    return Number.POSITIVE_INFINITY;
   }
 
   const parsed = Date.parse(timestamp);
   if (!Number.isFinite(parsed)) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.max(0, Math.floor((Date.now() - parsed) / 1000));
+}
+
+function quoteWithinAgeLimit(timestamp?: string, maxAgeSeconds = MAX_LIVE_QUOTE_AGE_SECONDS) {
+  return quoteAgeSeconds(timestamp) <= maxAgeSeconds;
+}
+
+function quoteAgeLabel(timestamp?: string) {
+  const ageSeconds = quoteAgeSeconds(timestamp);
+  if (!Number.isFinite(ageSeconds)) {
     return "";
   }
 
-  const ageSeconds = Math.max(0, Math.floor((Date.now() - parsed) / 1000));
   return `${ageSeconds}s old`;
 }
 
@@ -281,6 +294,7 @@ function AgentCard({
           <Text style={styles.forexTableHint}>
             Bid/Ask source: {mt4QuotesFresh ? "MT4 realtime feed" : "derived from market signal price"}
           </Text>
+          <Text style={styles.forexTableHint}>Rows older than 30s switch to derived values automatically.</Text>
           <View style={styles.forexTableHeaderRow}>
             <Text style={[styles.forexHeaderCell, styles.cellPair]}>Currency Pair</Text>
             <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Live Buy Price</Text>
@@ -300,10 +314,13 @@ function AgentCard({
           {agent.symbols.map((symbol) => {
             const signal = symbol.bestSignal;
             const mt4Quote = findMt4Quote(symbol.symbol, quotesBySymbol);
-            const liveBuy = mt4Quote?.ask ?? estimateBuyPrice(signal);
-            const liveSell = mt4Quote?.bid ?? estimateSellPrice(signal);
-            const liveTime = formatAestTimestamp(mt4Quote?.timestamp);
-            const liveAge = quoteAgeLabel(mt4Quote?.timestamp);
+            const quoteIsFresh = quoteWithinAgeLimit(mt4Quote?.timestamp);
+            const effectiveQuote = quoteIsFresh ? mt4Quote : null;
+            const liveBuy = effectiveQuote?.ask ?? estimateBuyPrice(signal);
+            const liveSell = effectiveQuote?.bid ?? estimateSellPrice(signal);
+            const liveTime = effectiveQuote ? formatAestTimestamp(effectiveQuote.timestamp) : "-";
+            const liveAge = effectiveQuote ? quoteAgeLabel(effectiveQuote.timestamp) : "STALE >30s";
+            const liveTimeColor = effectiveQuote ? quoteFreshnessColor(effectiveQuote.timestamp) : theme.colors.negative;
             const analysisKey = `${agent.agent}:${symbol.symbol}:${signal.timeframe}`;
             const analysisOpen = selectedAnalysisKey === analysisKey;
 
@@ -321,7 +338,7 @@ function AgentCard({
                     style={[
                       styles.forexCell,
                       styles.cellLiveTime,
-                      { color: quoteFreshnessColor(mt4Quote?.timestamp) }
+                      { color: liveTimeColor }
                     ]}
                   >
                     {liveTime}{liveAge ? ` (${liveAge})` : ""}
