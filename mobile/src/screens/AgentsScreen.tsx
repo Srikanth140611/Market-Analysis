@@ -203,7 +203,7 @@ function confidenceGapMeta(signal: MarketAgentTimeframeSignal) {
   }
 
   const gap = Math.abs(signal.confidence - signal.calibratedConfidence);
-  if (gap <= 6) {
+  if (gap <= 4) {
     return {
       text: `${signal.confidence}%/${signal.calibratedConfidence}%`,
       toneLabel: "ALIGNED",
@@ -211,7 +211,7 @@ function confidenceGapMeta(signal: MarketAgentTimeframeSignal) {
     };
   }
 
-  if (gap <= 14) {
+  if (gap <= 10) {
     return {
       text: `${signal.confidence}%/${signal.calibratedConfidence}%`,
       toneLabel: "WATCH",
