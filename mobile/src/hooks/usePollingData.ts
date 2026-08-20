@@ -9,6 +9,7 @@ export function usePollingData<T>(fetcher: () => Promise<T>, intervalMs: number)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const inFlight = useRef(false);
   const fetcherRef = useRef(fetcher);
+  const failureCountRef = useRef(0);
 
   useEffect(() => {
     fetcherRef.current = fetcher;
@@ -27,19 +28,27 @@ export function usePollingData<T>(fetcher: () => Promise<T>, intervalMs: number)
       setError(null);
       setNotice(getApiNotice());
       setLastUpdated(new Date());
+      failureCountRef.current = 0;
     } catch (err) {
       const nextNotice = getApiNotice();
+      failureCountRef.current += 1;
+
       if (nextNotice) {
         setError(null);
+        setNotice(nextNotice);
+      } else if (data) {
+        // Keep last known good data and avoid noisy transient failures.
+        setError(null);
+        setNotice("Live refresh is delayed. Showing last successful data.");
       } else {
         setError(err instanceof Error ? err.message : "Something went wrong");
+        setNotice(null);
       }
-      setNotice(nextNotice);
     } finally {
       setLoading(false);
       inFlight.current = false;
     }
-  }, []);
+  }, [data]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -59,7 +68,9 @@ export function usePollingData<T>(fetcher: () => Promise<T>, intervalMs: number)
         return;
       }
 
-      const delay = Math.max(1_000, intervalMs + Math.round((Math.random() * 2 - 1) * jitterMs));
+      const failureBackoffMultiplier = Math.min(4, Math.max(1, failureCountRef.current));
+      const baseDelay = intervalMs * failureBackoffMultiplier;
+      const delay = Math.max(1_000, baseDelay + Math.round((Math.random() * 2 - 1) * jitterMs));
 
       timer = setTimeout(() => {
         if (!isPageVisible()) {

@@ -20,7 +20,7 @@ const AGENT_MENU = [
   { key: "commodities", label: "Commodities Analysis", match: "Commodities" },
   { key: "oil", label: "Oil Analysis", match: "Oil" }
 ] as const;
-const MT4_QUOTES_REFRESH_MS = Platform.OS === "web" ? 1_000 : 1_500;
+const MT4_QUOTES_REFRESH_MS = Platform.OS === "web" ? 5_000 : 3_000;
 
 function sourceColor(source: string) {
   if (source === "live") {
@@ -437,7 +437,7 @@ export function AgentsScreen() {
     <View>
       <SectionCard title="3 Analysis Agents" subtitle="Forex, Commodities and Oil pattern intelligence with strategy levels">
         {loading ? <Text style={styles.muted}>Loading agent analysis...</Text> : null}
-        {error ? <Text style={styles.error}>{error}</Text> : null}
+        {error && !data ? <Text style={styles.error}>{error}</Text> : null}
         {data ? (
           <Text style={[styles.source, { color: sourceColor(data.source) }]}>Source: {data.source}{data.reason ? ` (${data.reason})` : ""}</Text>
         ) : null}
