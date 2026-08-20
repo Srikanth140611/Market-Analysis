@@ -337,7 +337,7 @@ function AgentCard({
           <Text style={styles.forexTableHint}>
             Bid/Ask source: {mt4QuotesFresh ? "MT4 realtime feed" : "derived from market signal price"}
           </Text>
-          <Text style={styles.forexTableHint}>Rows older than 30s or missing MT4 quote switch to derived values automatically.</Text>
+          <Text style={styles.forexTableHint}>Rows older than 30s switch to LIVE OFFLINE and use derived values automatically.</Text>
           <View style={styles.forexTableHeaderRow}>
             <Text style={[styles.forexHeaderCell, styles.cellPair]}>Currency Pair</Text>
             <Text style={[styles.forexHeaderCell, styles.cellPrice]}>Live Buy Price</Text>
@@ -366,12 +366,12 @@ function AgentCard({
             const liveTime = effectiveQuote
               ? formatAestTimestamp(effectiveQuote.timestamp)
               : hasMt4Quote
-                ? formatAestTimestamp(mt4Quote?.timestamp)
+                ? "-"
                 : "-";
             const liveAge = effectiveQuote
               ? quoteAgeLabel(effectiveQuote.timestamp)
               : hasMt4Quote
-                ? "STALE >30s"
+                ? "LIVE OFFLINE"
                 : "NO MT4";
             const liveTimeColor = effectiveQuote
               ? quoteFreshnessColor(effectiveQuote.timestamp)
