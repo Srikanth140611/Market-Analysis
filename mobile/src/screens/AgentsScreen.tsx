@@ -120,6 +120,28 @@ function formatAestTimestamp(timestamp?: string) {
   }
 }
 
+function quoteFreshnessColor(timestamp?: string) {
+  if (!timestamp) {
+    return theme.colors.muted;
+  }
+
+  const parsed = Date.parse(timestamp);
+  if (!Number.isFinite(parsed)) {
+    return theme.colors.muted;
+  }
+
+  const ageMs = Date.now() - parsed;
+  if (ageMs <= 10_000) {
+    return theme.colors.positive;
+  }
+
+  if (ageMs <= 30_000) {
+    return theme.colors.warning;
+  }
+
+  return theme.colors.negative;
+}
+
 function estimateBuyPrice(signal: MarketAgentTimeframeSignal) {
   const spread = Math.max(0.00008, Math.min(0.00022, signal.currentPrice * 0.00012));
   return signal.currentPrice + spread / 2;
@@ -275,7 +297,15 @@ function AgentCard({
                   <Text style={[styles.forexCell, styles.cellPair]}>{symbol.symbol}</Text>
                   <Text style={[styles.forexCell, styles.cellPrice]}>{formatForexQuote(symbol.symbol, liveBuy)}</Text>
                   <Text style={[styles.forexCell, styles.cellPrice]}>{formatForexQuote(symbol.symbol, liveSell)}</Text>
-                  <Text style={[styles.forexCell, styles.cellLiveTime]}>{formatAestTimestamp(mt4Quote?.timestamp)}</Text>
+                  <Text
+                    style={[
+                      styles.forexCell,
+                      styles.cellLiveTime,
+                      { color: quoteFreshnessColor(mt4Quote?.timestamp) }
+                    ]}
+                  >
+                    {formatAestTimestamp(mt4Quote?.timestamp)}
+                  </Text>
                   <Text style={[styles.forexCell, styles.cellTimeframe]}>{signal.timeframe}</Text>
                   <Text style={[styles.forexCell, styles.cellTrend, { color: directionColor(signal.direction) }]}>{signal.direction.toUpperCase()}</Text>
                   <Text style={[styles.forexCell, styles.cellSignal]}>{signal.pattern.toUpperCase()}</Text>
